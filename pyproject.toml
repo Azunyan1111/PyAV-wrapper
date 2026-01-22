@@ -15,6 +15,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [build-system]
