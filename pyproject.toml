@@ -1,0 +1,22 @@
+[project]
+name = "pyav-wrapper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Azunyan1111", email = "admin@mail.azunyan1111.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "av>=14.0.0",
+    "numpy>=1.20.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
