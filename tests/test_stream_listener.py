@@ -384,71 +384,51 @@ class TestStreamListenerSRTIntegration:
 
         print(f"\nSRT送信開始: {SRT_OUTPUT_URL}")
 
-        while time.time() - start_time < duration:
-            with listener.video_queue_lock:
-                video_frames = list(listener.video_queue)
-                listener.video_queue.clear()
+        last_print_time = 0
 
-            for wrapped_frame in video_frames:
+        while time.time() - start_time < duration:
+            has_data = False
+
+            with listener.video_queue_lock:
+                if len(listener.video_queue) > 0:
+                    wrapped_frame = listener.video_queue.popleft()
+                    has_data = True
+                else:
+                    wrapped_frame = None
+
+            if wrapped_frame is not None:
                 planes = wrapped_frame.get_planes()
 
-                y_plane = planes[0]
-                u_plane = planes[1] if len(planes) > 1 else None
-                v_plane = planes[2] if len(planes) > 2 else None
+                if len(planes) > 1:
+                    planes[1][:] = 128
+                if len(planes) > 2:
+                    planes[2][:] = 128
 
-                if u_plane is not None:
-                    u_plane[:] = 128
-                if v_plane is not None:
-                    v_plane[:] = 128
+                wrapped_frame.set_planes(planes)
 
-                new_frame = av.VideoFrame(width, height, "yuv420p")
-                new_frame.planes[0].update(
-                    np.pad(
-                        y_plane,
-                        ((0, 0), (0, new_frame.planes[0].line_size - y_plane.shape[1])),
-                        mode="constant",
-                    ).tobytes()
-                )
-                if u_plane is not None:
-                    new_frame.planes[1].update(
-                        np.pad(
-                            u_plane,
-                            ((0, 0), (0, new_frame.planes[1].line_size - u_plane.shape[1])),
-                            mode="constant",
-                            constant_values=128,
-                        ).tobytes()
-                    )
-                if v_plane is not None:
-                    new_frame.planes[2].update(
-                        np.pad(
-                            v_plane,
-                            ((0, 0), (0, new_frame.planes[2].line_size - v_plane.shape[1])),
-                            mode="constant",
-                            constant_values=128,
-                        ).tobytes()
-                    )
-
-                new_frame.pts = video_frame_count
-                for packet in video_stream.encode(new_frame):
+                for packet in video_stream.encode(wrapped_frame.frame):
                     output_container.mux(packet)
                 video_frame_count += 1
 
             with listener.audio_queue_lock:
-                audio_frames = list(listener.audio_queue)
+                audio_frames_to_process = list(listener.audio_queue)
                 listener.audio_queue.clear()
+                if len(audio_frames_to_process) > 0:
+                    has_data = True
 
-            for wrapped_audio in audio_frames:
+            for wrapped_audio in audio_frames_to_process:
                 audio_frame = wrapped_audio.frame
-                audio_frame.pts = None
                 for packet in audio_stream.encode(audio_frame):
                     output_container.mux(packet)
                 audio_frame_count += 1
 
             elapsed = time.time() - start_time
-            if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+            if int(elapsed) != last_print_time and int(elapsed) % 5 == 0:
                 print(f"  経過: {int(elapsed)}秒, 映像: {video_frame_count}フレーム, 音声: {audio_frame_count}フレーム")
+                last_print_time = int(elapsed)
 
-            time.sleep(0.03)
+            if not has_data:
+                time.sleep(0.001)
 
         listener.stop()
 
