@@ -55,6 +55,9 @@ class StreamWriter:
         self.running = False
         self._thread: "Thread | None" = None
 
+        # 古いフレームの保持（フレームが取得できない場合の再利用用）
+        self._last_video_frame: "WrappedVideoFrame | None" = None
+
         # 自動起動
         self.start()
 
@@ -222,6 +225,8 @@ class StreamWriter:
     def _process_video_frame(self) -> "WrappedVideoFrame | None":
         """映像フレームを取得
 
+        is_bad_frameがTrueの場合は、最後に送信したフレームの生データで差し替える。
+
         Returns:
             WrappedVideoFrame、またはNone
         """
@@ -229,6 +234,15 @@ class StreamWriter:
             wrapped_frame: WrappedVideoFrame = self.video_queue.get(timeout=1 / 30)
         except queue.Empty:
             return None
+
+        if wrapped_frame.is_bad_frame:
+            # 最後に送信したフレームの生データで差し替え
+            if self._last_video_frame is not None:
+                last_planes = self._last_video_frame.get_planes()
+                wrapped_frame.set_planes(last_planes)
+        else:
+            # 生データがある場合は保存
+            self._last_video_frame = wrapped_frame
 
         return wrapped_frame
 

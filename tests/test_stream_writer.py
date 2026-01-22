@@ -339,3 +339,83 @@ class TestStreamWriterWithListenerIntegration:
 
         assert video_frame_count > 0, "映像フレームが送信されませんでした"
         assert audio_frame_count > 0, "音声フレームが送信されませんでした"
+
+
+class TestStreamWriterLastFrameReuse:
+    """古いフレーム再利用機能のテスト"""
+
+    def test_last_video_frame_initialized_as_none(self):
+        """_last_video_frameが初期状態でNoneである"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            assert writer._last_video_frame is None
+            writer.stop()
+
+    def test_last_video_frame_saved_after_processing(self):
+        """生データがあるフレームを処理後、_last_video_frameに保存される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            # スレッドを停止して直接テスト
+            writer.stop()
+
+            # 生データありのフレームをキューに入れて直接処理
+            frame = create_test_video_frame(1280, 720)
+            frame.frame.pts = 100
+            writer.video_queue.put(frame)
+            writer._process_video_frame()
+
+            assert writer._last_video_frame is not None
+
+    def test_bad_frame_replaced_with_last_frame_data(self):
+        """is_bad_frameがTrueのフレームは、最後のフレームの生データで差し替えられる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            # スレッドを停止して直接テスト
+            writer.stop()
+
+            # 1. 正常なフレームを処理（_last_video_frameに保存される）
+            frame1 = create_test_video_frame(1280, 720)
+            frame1.frame.pts = 100
+            # Y planeを特定の値（200）で埋める
+            y_plane = frame1.frame.planes[0]
+            y_data = np.full(y_plane.buffer_size, 200, dtype=np.uint8)
+            y_plane.update(y_data)
+            writer.video_queue.put(frame1)
+            writer._process_video_frame()
+
+            # 2. is_bad_frame=Trueのフレームを作成
+            bad_frame = av.VideoFrame(1280, 720, "yuv420p")
+            bad_frame.pts = 200  # PTSは異なる値
+            wrapped_bad = WrappedVideoFrame(bad_frame)
+            wrapped_bad.is_bad_frame = True
+
+            # _process_video_frameを直接テスト
+            writer.video_queue.put(wrapped_bad)
+            result = writer._process_video_frame()
+
+            # 結果の検証
+            assert result is not None
+            # PTSは元のフレームのまま維持される
+            assert result.frame.pts == 200
+            # 生データが差し替えられたことを確認（Y planeが200で埋められている）
+            result_planes = result.get_planes()
+            assert len(result_planes) == 3
+            assert result_planes[0][0, 0] == 200

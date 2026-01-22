@@ -7,11 +7,22 @@ class WrappedVideoFrame:
 
     def __init__(self, frame: av.VideoFrame):
         self._frame = frame
+        self._is_bad_frame = False
 
     @property
     def frame(self) -> av.VideoFrame:
         """元のAVFrameを取得"""
         return self._frame
+
+    @property
+    def is_bad_frame(self) -> bool:
+        """フレームが不正かどうかを取得"""
+        return self._is_bad_frame
+
+    @is_bad_frame.setter
+    def is_bad_frame(self, value: bool) -> None:
+        """フレームが不正かどうかを設定"""
+        self._is_bad_frame = value
 
     def get_buffer(self) -> np.ndarray:
         """フレーム全体のバッファをnumpy配列として取得
