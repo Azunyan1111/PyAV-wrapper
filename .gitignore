@@ -5,9 +5,10 @@ __pycache__/
 *.so
 
 *.mp4
+*.ts
 .env
-stream_listener.py
-thread_ffmpeg_streamer.py
+/stream_listener.py
+/thread_ffmpeg_streamer.py
 
 # Virtual environments
 .venv/

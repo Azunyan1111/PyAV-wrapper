@@ -1,7 +1,7 @@
 .PHONY: test test-stream test-output
 
 test:
-	uv run pytest tests/ -v
+	uv run pytest
 
 test-stream:
 	uv run pytest tests/test_stream_listener.py::TestStreamListenerSRTIntegration::test_srt_receive_grayscale_and_stream_to_srt -v -s

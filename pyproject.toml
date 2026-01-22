@@ -15,9 +15,16 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    "pytest-timeout>=2.0.0",
+    "pytest-xdist>=3.0.0",
     "python-dotenv>=1.0.0",
 ]
 
 [build-system]
 requires = ["uv_build>=0.8.4,<0.9.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+timeout = 30
+addopts = "-v -n auto"
+testpaths = ["tests"]
