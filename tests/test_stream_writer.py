@@ -340,6 +340,220 @@ class TestStreamWriterWithListenerIntegration:
         assert video_frame_count > 0, "映像フレームが送信されませんでした"
         assert audio_frame_count > 0, "音声フレームが送信されませんでした"
 
+    def test_listener_to_writer_crop_stream(self):
+        """StreamListenerで受信→中央80%クロップ→StreamWriterでSRTへ送信"""
+        duration = 30.0
+
+        # StreamListenerでSRTストリームを受信
+        listener = StreamListener(SRT_URL)
+
+        time.sleep(1.0)
+
+        # 最初の映像フレームを取得して解像度を確認
+        first_frame = None
+        while first_frame is None and listener.is_running:
+            if len(listener.video_queue) > 0:
+                first_frame = listener.video_queue[0]
+            time.sleep(0.1)
+
+        assert first_frame is not None, "映像フレームを受信できませんでした"
+
+        original_width = first_frame.frame.width
+        original_height = first_frame.frame.height
+
+        # 最初の音声フレームを取得してサンプルレートを確認
+        first_audio = None
+        while first_audio is None and listener.is_running:
+            if len(listener.audio_queue) > 0:
+                first_audio = listener.audio_queue[0]
+            time.sleep(0.1)
+
+        assert first_audio is not None, "音声フレームを受信できませんでした"
+
+        input_sample_rate = first_audio.frame.sample_rate
+        input_audio_layout = first_audio.frame.layout.name
+
+        # クロップ後のサイズを計算（80%）
+        crop_ratio = 0.8
+        crop_width = int(original_width * crop_ratio)
+        crop_height = int(original_height * crop_ratio)
+        # 2の倍数に調整
+        crop_width = crop_width - (crop_width % 2)
+        crop_height = crop_height - (crop_height % 2)
+
+        print(f"\n元の解像度: {original_width}x{original_height}")
+        print(f"クロップ後の解像度: {crop_width}x{crop_height}")
+        print(f"入力音声サンプルレート: {input_sample_rate}Hz")
+        print(f"入力音声レイアウト: {input_audio_layout}")
+
+        # StreamWriterを初期化（クロップ後のサイズで、入力と同じサンプルレートを使用）
+        writer = StreamWriter(
+            url=SRT_OUTPUT_URL,
+            width=crop_width,
+            height=crop_height,
+            fps=30,
+            sample_rate=input_sample_rate,
+            audio_layout=input_audio_layout,
+        )
+
+        start_time = time.time()
+        video_frame_count = 0
+        audio_frame_count = 0
+
+        print(f"SRT送信開始: {SRT_OUTPUT_URL}")
+
+        last_print_time = 0
+
+        while time.time() - start_time < duration:
+            # 映像フレームの処理
+            with listener.video_queue_lock:
+                if len(listener.video_queue) > 0:
+                    wrapped_frame = listener.video_queue.popleft()
+                else:
+                    wrapped_frame = None
+
+            if wrapped_frame is not None:
+                # 中央80%クロップ
+                cropped_frame = wrapped_frame.crop_center(ratio=crop_ratio)
+
+                # StreamWriterのキューに追加
+                writer.enqueue_video_frame(cropped_frame)
+                video_frame_count += 1
+
+            # 音声フレームの処理
+            with listener.audio_queue_lock:
+                audio_frames_to_process = list(listener.audio_queue)
+                listener.audio_queue.clear()
+
+            for wrapped_audio in audio_frames_to_process:
+                writer.enqueue_audio_frame(wrapped_audio)
+                audio_frame_count += 1
+
+            # 進捗表示（5秒ごと）
+            elapsed = time.time() - start_time
+            if int(elapsed) != last_print_time and int(elapsed) % 5 == 0:
+                print(
+                    f"  経過: {int(elapsed)}秒, 映像: {video_frame_count}フレーム, 音声: {audio_frame_count}フレーム"
+                )
+                last_print_time = int(elapsed)
+
+            time.sleep(0.001)
+
+        listener.stop()
+        writer.stop()
+
+        print(f"\nSRT送信完了")
+        print(f"映像フレーム数: {video_frame_count}")
+        print(f"音声フレーム数: {audio_frame_count}")
+
+        assert video_frame_count > 0, "映像フレームが送信されませんでした"
+        assert audio_frame_count > 0, "音声フレームが送信されませんでした"
+
+
+class TestStreamWriterFileOutput:
+    """StreamWriterファイル出力テスト（音声確認用）"""
+
+    @pytest.mark.skipif(
+        not SRT_AVAILABLE, reason="SRTストリームに接続できません"
+    )
+    def test_listener_to_writer_file_output(self):
+        """StreamListenerで受信→StreamWriterでファイルに書き出し（音声確認用）"""
+        output_file = Path(__file__).parent / "output_stream_writer.ts"
+        duration = 10.0
+        if True:
+
+            listener = StreamListener(SRT_URL)
+            time.sleep(1.0)
+
+            # 最初の映像フレームを取得
+            first_frame = None
+            while first_frame is None and listener.is_running:
+                if len(listener.video_queue) > 0:
+                    first_frame = listener.video_queue[0]
+                time.sleep(0.1)
+
+            assert first_frame is not None, "映像フレームを受信できませんでした"
+
+            # 最初の音声フレームを取得
+            first_audio = None
+            while first_audio is None and listener.is_running:
+                if len(listener.audio_queue) > 0:
+                    first_audio = listener.audio_queue[0]
+                time.sleep(0.1)
+
+            assert first_audio is not None, "音声フレームを受信できませんでした"
+
+            width = first_frame.frame.width
+            height = first_frame.frame.height
+            sample_rate = first_audio.frame.sample_rate
+            audio_layout = first_audio.frame.layout.name
+
+            print(f"\n解像度: {width}x{height}")
+            print(f"サンプルレート: {sample_rate}Hz")
+            print(f"音声レイアウト: {audio_layout}")
+
+            writer = StreamWriter(
+                url=str(output_file),
+                width=width,
+                height=height,
+                fps=30,
+                sample_rate=sample_rate,
+                audio_layout=audio_layout,
+            )
+
+            start_time = time.time()
+            video_count = 0
+            audio_count = 0
+
+            while time.time() - start_time < duration:
+                # バッチ処理: 映像30フレーム分を取り出す
+                video_frames = listener.pop_all_video_queue()
+                audio_frames = listener.pop_all_audio_queue()
+
+                if len(video_frames) == 0 and len(audio_frames) == 0:
+                    # バッチが溜まるまで待機
+                    time.sleep(0.1)
+                    continue
+
+                # パイプライン処理（ここでは単純にenqueue）
+                for frame in video_frames:
+                    writer.enqueue_video_frame(frame)
+                    video_count += 1
+
+                for af in audio_frames:
+                    writer.enqueue_audio_frame(af)
+                    audio_count += 1
+
+            listener.stop()
+            writer.stop()
+            time.sleep(1.0)  # フラッシュ完了を待つ
+
+            print(f"映像フレーム数: {video_count}")
+            print(f"音声フレーム数: {audio_count}")
+            print(f"出力ファイル: {output_file}")
+
+            assert output_file.exists()
+            assert output_file.stat().st_size > 0
+
+            # ffprobeで音声情報を確認
+            import subprocess
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=duration,sample_rate,channels",
+                 "-of", "csv=p=0", str(output_file)],
+                capture_output=True, text=True
+            )
+            print(f"ffprobe結果: {result.stdout.strip()}")
+
+            # 動画の長さも確認
+            result2 = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=duration",
+                 "-of", "csv=p=0", str(output_file)],
+                capture_output=True, text=True
+            )
+            print(f"映像duration: {result2.stdout.strip()}")
+
 
 class TestStreamWriterLastFrameReuse:
     """古いフレーム再利用機能のテスト"""

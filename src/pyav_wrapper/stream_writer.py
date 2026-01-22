@@ -171,7 +171,12 @@ class StreamWriter:
             actual_height = first_frame.frame.height
 
             # PyAVコンテナとストリームを初期化
-            container = av.open(self.url, mode="w", format="mpegts")
+            # ファイル出力の場合はformatを明示せず拡張子から自動判別
+            # SRT出力の場合はmpegtsを使用
+            if self.url.startswith("srt://"):
+                container = av.open(self.url, mode="w", format="mpegts")
+            else:
+                container = av.open(self.url, mode="w")
 
             video_stream = container.add_stream("libx264", rate=self.fps)
             video_stream.width = actual_width
@@ -182,7 +187,7 @@ class StreamWriter:
             audio_stream = container.add_stream("aac", rate=self.sample_rate)
             audio_stream.layout = self.audio_layout
 
-            # 最初のフレームを処理
+            # 最初のフレームを処理（元のPTSをそのまま使用）
             for packet in video_stream.encode(first_frame.frame):
                 container.mux(packet)
 
@@ -193,6 +198,7 @@ class StreamWriter:
                 wrapped_frame = self._process_video_frame()
                 if wrapped_frame is not None:
                     has_data = True
+                    # 元のPTSとtime_baseをそのまま使用
                     for packet in video_stream.encode(wrapped_frame.frame):
                         container.mux(packet)
 
@@ -202,6 +208,7 @@ class StreamWriter:
                     if wrapped_audio is None:
                         break
                     has_data = True
+                    # 元のPTSとtime_baseをそのまま使用
                     for packet in audio_stream.encode(wrapped_audio.frame):
                         container.mux(packet)
 
