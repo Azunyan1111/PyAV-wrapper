@@ -17,3 +17,6 @@ test-writer-stream:
 
 test-whep:
 	uv run pytest tests/test_raw_subprocess_pipe_stream_listener.py -v -s --timeout 60
+
+test-whip:
+	uv run pytest tests/test_raw_subprocess_pipe_stream_writer.py -v -s --timeout 120
