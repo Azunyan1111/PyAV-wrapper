@@ -1,4 +1,4 @@
-.PHONY: test test-stream test-output test-writer-stream
+.PHONY: test test-stream test-output test-writer-stream test-whep
 
 test:
 	uv run pytest
@@ -11,3 +11,6 @@ test-output:
 
 test-writer-stream:
 	uv run pytest tests/test_stream_writer.py::TestStreamWriterWithListenerIntegration::test_listener_to_writer_grayscale_stream -v -s -n 0 --timeout=120
+
+test-whep:
+	uv run pytest tests/test_raw_subprocess_pipe_stream_listener.py -v -s --timeout 60
