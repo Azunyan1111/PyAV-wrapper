@@ -26,5 +26,8 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 timeout = 30
-addopts = "-v -n auto"
+addopts = "-v -n auto -m 'not srt'"
 testpaths = ["tests"]
+markers = [
+    "srt: SRT E2Eテスト（ffmpegによるSRT送信が必要）",
+]

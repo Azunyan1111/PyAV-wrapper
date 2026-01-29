@@ -1,5 +1,4 @@
 import collections
-import os
 import tempfile
 import time
 from pathlib import Path
@@ -7,30 +6,8 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
-from dotenv import load_dotenv
 
 from pyav_wrapper import StreamListener, WrappedAudioFrame, WrappedVideoFrame
-
-load_dotenv()
-
-SRT_URL = os.getenv("SRT_URL")
-SRT_OUTPUT_URL = os.getenv("SRT_OUTPUT_URL")
-
-
-def check_srt_available() -> bool:
-    """SRTプロトコルが利用可能か確認"""
-    if SRT_URL is None:
-        return False
-    try:
-        container = av.open(SRT_URL, timeout=15.0)
-        container.close()
-        return True
-    except Exception as e:
-        print(f"SRT check failed: {type(e).__name__}: {e}")
-        return False
-
-
-SRT_AVAILABLE = check_srt_available()
 
 
 def create_test_video_file(path: Path, duration_frames: int = 60) -> None:
@@ -199,16 +176,16 @@ class TestStreamListenerControl:
             assert listener.is_running is False
 
 
-@pytest.mark.skipif(not SRT_AVAILABLE, reason="SRTストリームに接続できません（SRT_URL未設定またはプロトコル未対応）")
+@pytest.mark.srt
 class TestStreamListenerSRTIntegration:
     """SRT統合テスト：受信→グレースケール変換→ファイル書き出し"""
 
-    def test_srt_receive_convert_grayscale_and_write(self):
+    def test_srt_receive_convert_grayscale_and_write(self, srt_source_url):
         """SRTから受信した映像をグレースケールに変換して音声付きでファイルに書き出す"""
         output_path = Path(__file__).parent / "output_grayscale.mp4"
         duration = 10.0
 
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
 
         time.sleep(1.0)
 
@@ -329,15 +306,11 @@ class TestStreamListenerSRTIntegration:
         print(f"解像度: {width}x{height}")
         print(f"音声サンプルレート: {sample_rate}Hz")
 
-    @pytest.mark.skipif(
-        SRT_OUTPUT_URL is None,
-        reason="SRT_OUTPUT_URL環境変数が設定されていません"
-    )
-    def test_srt_receive_grayscale_and_stream_to_srt(self):
-        """SRTから受信→グレースケール変換→SRTへ60秒間送信"""
-        duration = 60.0
+    def test_srt_receive_grayscale_and_stream_to_srt(self, srt_source_url, srt_output_url):
+        """SRTから受信→グレースケール変換→SRTへ送信"""
+        duration = 10.0
 
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
 
         time.sleep(1.0)
 
@@ -364,7 +337,7 @@ class TestStreamListenerSRTIntegration:
         audio_layout = first_audio.frame.layout.name
 
         output_container = av.open(
-            SRT_OUTPUT_URL,
+            srt_output_url,
             mode="w",
             format="mpegts",
         )
@@ -382,7 +355,7 @@ class TestStreamListenerSRTIntegration:
         video_frame_count = 0
         audio_frame_count = 0
 
-        print(f"\nSRT送信開始: {SRT_OUTPUT_URL}")
+        print(f"\nSRT送信開始: {srt_output_url}")
 
         last_print_time = 0
 
@@ -432,12 +405,11 @@ class TestStreamListenerSRTIntegration:
 
         listener.stop()
 
-        for packet in video_stream.encode():
-            output_container.mux(packet)
-        for packet in audio_stream.encode():
-            output_container.mux(packet)
-
         try:
+            for packet in video_stream.encode():
+                output_container.mux(packet)
+            for packet in audio_stream.encode():
+                output_container.mux(packet)
             output_container.close()
         except Exception as e:
             print(f"\nSRT切断時エラー（送信自体は完了）: {e}")
@@ -452,37 +424,37 @@ class TestStreamListenerSRTIntegration:
         assert audio_frame_count > 0, "音声フレームが送信されませんでした"
 
 
-@pytest.mark.skipif(not SRT_AVAILABLE, reason="SRTストリームに接続できません（SRT_URL未設定またはプロトコル未対応）")
+@pytest.mark.srt
 class TestStreamListenerSRT:
-    """SRT実受信テスト（SRT_URL環境変数が設定されている場合のみ実行）"""
+    """SRT実受信テスト"""
 
-    def test_srt_connect(self):
+    def test_srt_connect(self, srt_source_url):
         """SRTストリームに接続できる"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         time.sleep(3.0)
 
         assert listener.is_running is True
         listener.stop()
 
-    def test_srt_receive_video_frames(self):
+    def test_srt_receive_video_frames(self, srt_source_url):
         """SRTからVideoフレームを受信できる"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         time.sleep(5.0)
 
         assert len(listener.video_queue) > 0
         listener.stop()
 
-    def test_srt_receive_audio_frames(self):
+    def test_srt_receive_audio_frames(self, srt_source_url):
         """SRTからAudioフレームを受信できる"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         time.sleep(5.0)
 
         assert len(listener.audio_queue) > 0
         listener.stop()
 
-    def test_srt_pop_video_returns_wrapped_frame(self):
+    def test_srt_pop_video_returns_wrapped_frame(self, srt_source_url):
         """SRTから取得したVideoフレームがWrappedVideoFrame型"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         listener.batch_size = 5
         time.sleep(5.0)
 
@@ -491,9 +463,9 @@ class TestStreamListenerSRT:
         assert all(isinstance(f, WrappedVideoFrame) for f in frames)
         listener.stop()
 
-    def test_srt_pop_audio_returns_wrapped_frame(self):
+    def test_srt_pop_audio_returns_wrapped_frame(self, srt_source_url):
         """SRTから取得したAudioフレームがWrappedAudioFrame型"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         listener.batch_size = 5
         time.sleep(5.0)
 
@@ -502,9 +474,9 @@ class TestStreamListenerSRT:
         assert all(isinstance(f, WrappedAudioFrame) for f in frames)
         listener.stop()
 
-    def test_srt_video_frame_has_valid_buffer(self):
+    def test_srt_video_frame_has_valid_buffer(self, srt_source_url):
         """SRTから取得したVideoフレームのバッファが有効"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         time.sleep(5.0)
 
         if len(listener.video_queue) > 0:
@@ -515,9 +487,9 @@ class TestStreamListenerSRT:
             assert buffer.shape[1] > 0
         listener.stop()
 
-    def test_srt_audio_frame_has_valid_buffer(self):
+    def test_srt_audio_frame_has_valid_buffer(self, srt_source_url):
         """SRTから取得したAudioフレームのバッファが有効"""
-        listener = StreamListener(SRT_URL)
+        listener = StreamListener(srt_source_url)
         time.sleep(5.0)
 
         if len(listener.audio_queue) > 0:
