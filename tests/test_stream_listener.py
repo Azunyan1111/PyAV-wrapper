@@ -1,5 +1,6 @@
 import collections
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -172,6 +173,126 @@ class TestStreamListenerControl:
             listener = StreamListener(str(test_file), width=640, height=480)
             time.sleep(0.3)
 
+            listener.stop()
+            assert listener.is_running is False
+
+
+class TestStreamListenerReconnection:
+    """StreamListener自動再接続機能のテスト"""
+
+    def test_reconnection_variables_initialized(self):
+        """再接続関連の変数が正しく初期化される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            try:
+                assert isinstance(listener._last_successful_read_time, float)
+                assert listener._restart_threshold == 10.0
+                assert listener._restart_threshold_increment == 1.0
+                assert listener._restart_threshold_max == 20.0
+                assert listener._restart_wait_seconds == 5.0
+                assert isinstance(listener._restart_lock, type(threading.Lock()))
+                assert listener._monitor_thread is not None
+            finally:
+                listener.stop()
+
+    def test_monitor_thread_running(self):
+        """監視スレッドが起動している"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file, duration_frames=90)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            try:
+                assert listener._monitor_thread is not None
+                assert listener._monitor_thread.is_alive() is True
+            finally:
+                listener.stop()
+
+    def test_last_successful_read_time_updated(self):
+        """フレーム読み込み成功でlast_successful_read_timeが更新される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file, duration_frames=90)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            try:
+                initial_time = listener._last_successful_read_time
+                time.sleep(1.0)
+                assert listener._last_successful_read_time > initial_time
+            finally:
+                listener.stop()
+
+    def test_stop_cleans_up_all_threads_and_container(self):
+        """stop()で全スレッド終了とcontainer=None"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file, duration_frames=90)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            time.sleep(0.5)
+
+            listener.stop()
+            assert listener.is_running is False
+            assert listener.container is None
+            assert listener._monitor_thread is None or not listener._monitor_thread.is_alive()
+            assert listener._read_thread is None
+
+    def test_reconnection_triggered_on_container_close(self):
+        """containerを強制closeすると再接続が試みられる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file, duration_frames=300)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            time.sleep(0.5)
+
+            # 閾値を短縮してテストを高速化
+            listener._restart_threshold = 2.0
+            listener._restart_wait_seconds = 1.0
+
+            # containerを強制closeして切断をシミュレート
+            if listener.container:
+                try:
+                    listener.container.close()
+                except Exception:
+                    pass
+
+            # 再接続を待機
+            time.sleep(5.0)
+
+            try:
+                # 再接続が試行された証拠: 閾値が増加している
+                assert listener._restart_threshold > 2.0
+            finally:
+                listener.stop()
+
+    def test_stop_during_reconnection(self):
+        """再接続中にstop()を呼んでも安全に停止する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file, duration_frames=300)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            time.sleep(0.5)
+
+            # 閾値を短縮
+            listener._restart_threshold = 2.0
+            listener._restart_wait_seconds = 3.0
+
+            # containerを強制closeして切断をシミュレート
+            if listener.container:
+                try:
+                    listener.container.close()
+                except Exception:
+                    pass
+
+            # 再接続開始を待つ
+            time.sleep(1.0)
+
+            # stop()を呼んでデッドロックしないことを確認
             listener.stop()
             assert listener.is_running is False
 

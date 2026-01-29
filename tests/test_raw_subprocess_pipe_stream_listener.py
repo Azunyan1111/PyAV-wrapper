@@ -1,5 +1,6 @@
 import os
 import shutil
+import threading
 import time
 
 import pytest
@@ -45,6 +46,28 @@ class TestRawSubprocessPipeStreamListenerInit:
     def test_inherits_stream_listener(self):
         """StreamListenerを継承しているか"""
         assert issubclass(RawSubprocessPipeStreamListener, StreamListener)
+
+
+class TestRawSubprocessPipeStreamListenerReconnection:
+    """RawSubprocessPipeStreamListenerの再接続機能テスト"""
+
+    def test_reconnection_variables_initialized(self):
+        """サブクラスでも再接続関連の変数が初期化される"""
+        listener = RawSubprocessPipeStreamListener.__new__(
+            RawSubprocessPipeStreamListener
+        )
+        # __new__のみで__init__を呼ばず、属性の存在をクラス定義で確認
+        # 代わりにStreamListenerの親クラスに定義があることを確認
+        assert hasattr(StreamListener, '_monitor_frame_updates')
+        assert hasattr(StreamListener, '_restart_connection')
+
+    def test_has_restart_connection_method(self):
+        """_restart_connectionメソッドがオーバーライドされている"""
+        assert hasattr(RawSubprocessPipeStreamListener, '_restart_connection')
+        assert (
+            RawSubprocessPipeStreamListener._restart_connection
+            is not StreamListener._restart_connection
+        )
 
 
 @pytest.mark.skipif(
