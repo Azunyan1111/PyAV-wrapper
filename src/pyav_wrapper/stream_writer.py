@@ -1,3 +1,4 @@
+import os
 import queue
 import sys
 import threading
@@ -72,6 +73,16 @@ class StreamWriter:
         # リアルタイムペーシング用
         self._wall_clock_origin: float = 0.0
         self._pts_origin: float = 0.0
+
+        # Reconnection
+        self._last_successful_write_time: float = 0.0
+        self._restart_threshold: float = 10.0
+        self._restart_threshold_increment: float = 1.0
+        self._restart_threshold_max: float = 20.0
+        self._restart_wait_seconds: float = 5.0
+        self._restart_frame_wait_timeout: float = 30.0
+        self._restart_lock: threading.Lock = threading.Lock()
+        self._monitor_thread: threading.Thread | None = None
 
         # 自動起動
         self.start()
@@ -182,8 +193,11 @@ class StreamWriter:
             self._audio_stream.layout = self.audio_layout
 
             self.is_running = True
+            self._last_successful_write_time = time.time()
             self._thread = threading.Thread(target=self._write_frames, daemon=True)
             self._thread.start()
+            self._monitor_thread = threading.Thread(target=self._monitor_write_updates, daemon=True)
+            self._monitor_thread.start()
             return "ストリーム処理を開始しました"
         except Exception as e:
             return f"処理開始エラー: {str(e)}"
@@ -226,8 +240,12 @@ class StreamWriter:
             # 最初のフレームを処理（元のPTSをそのまま使用）
             for packet in self._video_stream.encode(self._first_frame.frame):
                 self.container.mux(packet)
+            self._last_successful_write_time = time.time()
 
             while self.is_running:
+                if self.container is None:
+                    break
+
                 has_data = False
 
                 # 映像フレームの処理
@@ -236,8 +254,12 @@ class StreamWriter:
                     has_data = True
                     self._pace_frame(wrapped_frame.frame)
                     # 元のPTSとtime_baseをそのまま使用
-                    for packet in self._video_stream.encode(wrapped_frame.frame):
-                        self.container.mux(packet)
+                    try:
+                        for packet in self._video_stream.encode(wrapped_frame.frame):
+                            self.container.mux(packet)
+                        self._last_successful_write_time = time.time()
+                    except Exception as e:
+                        print(f"StreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
                 # 音声フレームの処理（キューにある全フレームを処理）
                 while True:
@@ -246,8 +268,12 @@ class StreamWriter:
                         break
                     has_data = True
                     # 元のPTSとtime_baseをそのまま使用
-                    for packet in self._audio_stream.encode(wrapped_audio.frame):
-                        self.container.mux(packet)
+                    try:
+                        for packet in self._audio_stream.encode(wrapped_audio.frame):
+                            self.container.mux(packet)
+                        self._last_successful_write_time = time.time()
+                    except Exception as e:
+                        print(f"StreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
 
                 if not has_data:
                     time.sleep(0.001)
@@ -277,6 +303,116 @@ class StreamWriter:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
         self._thread = None
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=10.0)
+        self._monitor_thread = None
+
+    def _monitor_write_updates(self) -> None:
+        """書き込み更新を監視し、閾値超過時に再接続を試みる"""
+        while self.is_running:
+            time.sleep(1.0)
+            if not self.is_running:
+                break
+
+            elapsed = time.time() - self._last_successful_write_time
+            if elapsed > self._restart_threshold:
+                print(f"書き込み更新が{elapsed:.1f}秒間停止。再接続を試みます (閾値: {self._restart_threshold:.1f}秒)")
+                with self._restart_lock:
+                    if not self.is_running:
+                        break
+                    self._restart_threshold += self._restart_threshold_increment
+                    if self._restart_threshold >= self._restart_threshold_max:
+                        print(f"再接続閾値が上限({self._restart_threshold_max}秒)に達しました。プロセスを終了します。")
+                        os._exit(1)
+                    self._restart_connection()
+                    # _restart_connectionがFalseを返した場合もループを継続し再試行する
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """is_runningチェック付きスリープ。0.5秒間隔で分割。"""
+        remaining = seconds
+        while remaining > 0 and self.is_running:
+            sleep_time = min(remaining, 0.5)
+            time.sleep(sleep_time)
+            remaining -= sleep_time
+
+    def _wait_for_first_frame(self, timeout: float) -> "WrappedVideoFrame | None":
+        """タイムアウト付きで最初のフレームをキューから取得。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.is_running:
+                return None
+            try:
+                return self.video_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+        return None
+
+    def _restart_connection(self) -> bool:
+        """ストリーム接続を再確立する。サブクラスでオーバーライド可能。
+
+        Returns:
+            bool: 再接続に成功した場合True、失敗した場合False
+        """
+        if not self.is_running:
+            return False
+
+        # 古いcontainerをNoneに設定後close（_write_framesがbreakする）
+        old_container = self.container
+        self.container = None
+        if old_container:
+            try:
+                old_container.close()
+            except Exception:
+                pass
+
+        # 古い書込スレッドを待機
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+
+        if not self.is_running:
+            return False
+
+        # 再接続待機
+        self._interruptible_sleep(self._restart_wait_seconds)
+
+        if not self.is_running:
+            return False
+
+        # キューから次のフレームを取得して_first_frameに設定（タイムアウト付き）
+        first_frame = self._wait_for_first_frame(self._restart_frame_wait_timeout)
+        if first_frame is None:
+            return False
+
+        self._first_frame = first_frame
+
+        # フレームから実際の解像度を取得
+        actual_width = first_frame.frame.width
+        actual_height = first_frame.frame.height
+
+        # 新コンテナ・ストリームを作成
+        try:
+            if self.url.startswith("srt://"):
+                self.container = av.open(self.url, mode="w", format="mpegts")
+            else:
+                self.container = av.open(self.url, mode="w")
+
+            self._video_stream = self.container.add_stream("libx264", rate=self.fps)
+            self._video_stream.width = actual_width
+            self._video_stream.height = actual_height
+            self._video_stream.pix_fmt = "yuv420p"
+            self._video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
+
+            self._audio_stream = self.container.add_stream("aac", rate=self.sample_rate)
+            self._audio_stream.layout = self.audio_layout
+
+            self._last_successful_write_time = time.time()
+            self._thread = threading.Thread(target=self._write_frames, daemon=True)
+            self._thread.start()
+            print("StreamWriter再接続に成功しました")
+            return True
+        except Exception as e:
+            print(f"StreamWriter再接続エラー: {str(e)}")
+            return False
 
     def __del__(self) -> None:
         """リソース解放"""

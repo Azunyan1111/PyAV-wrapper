@@ -1,5 +1,8 @@
+import subprocess
 import tempfile
+import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -738,3 +741,1062 @@ class TestStreamWriterLastFrameReuse:
             result_planes = result.get_planes()
             assert len(result_planes) == 3
             assert result_planes[0][0, 0] == 200
+
+
+class TestStreamWriterMuxErrorRecovery:
+    """muxエラー発生時にWriterスレッドが生存し続けることのテスト"""
+
+    def test_writer_thread_survives_pts_discontinuity(self):
+        """PTS不連続（Listener再接続シミュレーション）後もWriterスレッドが生存する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_pts_discontinuity.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+
+            # フェーズ1: 正常なフレーム（PTS=0,3000,6000,...）を送信
+            for i in range(10):
+                frame = av.VideoFrame(640, 480, "yuv420p")
+                for plane in frame.planes:
+                    data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+                    plane.update(data)
+                frame.pts = i * 3000
+                frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(WrappedVideoFrame(frame))
+
+            # スレッド起動と最初のフレーム処理を待機
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive(), "フェーズ1後にWriterスレッドが停止している"
+
+            # フェーズ2: PTS不連続（再接続シミュレーション）
+            # PTSが大きな値から0に戻る
+            for i in range(10):
+                frame = av.VideoFrame(640, 480, "yuv420p")
+                for plane in frame.planes:
+                    data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+                    plane.update(data)
+                frame.pts = i * 3000  # 0に戻る
+                frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(WrappedVideoFrame(frame))
+
+            time.sleep(2.0)
+            assert writer._thread.is_alive(), "PTS不連続後にWriterスレッドが停止している"
+
+            # フェーズ3: 不連続後も正常なフレームを処理できる
+            for i in range(10):
+                frame = av.VideoFrame(640, 480, "yuv420p")
+                for plane in frame.planes:
+                    data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+                    plane.update(data)
+                frame.pts = (i + 10) * 3000
+                frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(WrappedVideoFrame(frame))
+
+            time.sleep(2.0)
+            assert writer._thread.is_alive(), "フェーズ3後にWriterスレッドが停止している"
+            assert writer.is_running is True
+
+            writer.stop()
+            assert output_file.exists()
+            assert output_file.stat().st_size > 0
+
+
+class TestRestartConnectionFrameWaitTimeout:
+    """_restart_connectionのフレーム待ちタイムアウトに関するテスト"""
+
+    def test_restart_connection_returns_false_when_no_frames_available(self):
+        """フレーム未供給時に_restart_connection()がタイムアウトしてFalseを返す"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_frame_wait_timeout.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+            writer._restart_frame_wait_timeout = 2.0
+
+            # フレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+
+            # フレームを供給せず_restart_connectionを呼ぶ
+            start = time.monotonic()
+            result = writer._restart_connection()
+            elapsed = time.monotonic() - start
+
+            # 戻り値がFalse、所要時間 < 5秒
+            assert result is False, "_restart_connectionがFalseを返すべきです"
+            assert elapsed < 5.0, f"タイムアウトまでに{elapsed:.1f}秒かかりました（5秒以内であるべき）"
+
+            writer.stop()
+
+    def test_restart_connection_returns_true_when_frame_available(self):
+        """フレーム供給ありで_restart_connection()がTrueを返す"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_frame_wait_success.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+            writer._restart_frame_wait_timeout = 10.0
+
+            # フレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+            time.sleep(2.0)
+            assert writer._thread is not None
+
+            # 遅延供給スレッドで1秒後にフレーム投入
+            def delayed_feed():
+                time.sleep(1.0)
+                f = create_test_video_frame(640, 480)
+                f.frame.pts = 0
+                f.frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(f)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            result = writer._restart_connection()
+            assert result is True, "_restart_connectionがTrueを返すべきです"
+
+            writer.stop()
+
+    def test_monitor_retries_after_frame_wait_timeout(self):
+        """フレーム待ちタイムアウト後にmonitorループが再試行し閾値が累積増加する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_monitor_retry.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 3.0
+            writer._restart_wait_seconds = 0.1
+            writer._restart_frame_wait_timeout = 2.0
+            writer._restart_threshold_max = 20.0
+            increment = writer._restart_threshold_increment
+            initial_threshold = writer._restart_threshold
+
+            # フレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+            time.sleep(2.0)
+            assert writer._thread is not None
+
+            # フレームを供給せず放置 -> monitorが再接続を複数回試行
+            # 1回目: 検知~4秒 + wait0.1秒 + frame_wait2秒 = ~6秒
+            # 2回目: 検知~1秒(閾値超過済み) + wait0.1秒 + frame_wait2秒 = ~3秒
+            # 合計 ~9秒で2回以上の再接続試行
+            time.sleep(15.0)
+
+            # 2回以上増加していることを検証
+            expected_min = initial_threshold + 2 * increment
+            assert writer._restart_threshold >= expected_min, \
+                f"閾値が2回以上増加していません: 現在={writer._restart_threshold}, " \
+                f"期待>={expected_min}"
+
+            writer.stop()
+
+
+class TestStopResponsivenessDuringRestart:
+    """stop()のレスポンシブ性テスト"""
+
+    def test_stop_completes_quickly_during_restart_wait(self):
+        """_restart_wait_seconds中にstop()が迅速に完了する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_stop_responsive.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 10.0
+            writer._restart_frame_wait_timeout = 30.0
+
+            # フレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+            time.sleep(2.0)
+            assert writer._thread is not None
+
+            # バックグラウンドで_restart_connectionを起動
+            restart_thread = threading.Thread(
+                target=writer._restart_connection, daemon=True
+            )
+            restart_thread.start()
+            time.sleep(0.5)  # restartがsleepに入るのを待つ
+
+            # stop()が迅速に完了することを検証
+            start = time.monotonic()
+            writer.stop()
+            elapsed = time.monotonic() - start
+
+            assert elapsed < 3.0, \
+                f"stop()が{elapsed:.1f}秒かかりました（3秒以内であるべき）"
+
+            restart_thread.join(timeout=3.0)
+            assert not restart_thread.is_alive(), "再接続スレッドが終了していません"
+
+    def test_stop_join_timeout_sufficient_for_monitor_thread(self):
+        """stop()完了後にmonitorスレッドが確実に停止している"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_stop_monitor.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+
+            # フレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+            time.sleep(2.0)
+            assert writer._monitor_thread is not None
+            assert writer._monitor_thread.is_alive()
+
+            monitor_thread = writer._monitor_thread
+
+            writer.stop()
+
+            assert not monitor_thread.is_alive(), \
+                "stop()完了後にmonitorスレッドが停止していません"
+
+
+class TestStreamWriterReconnection:
+    """StreamWriter再接続機能のテスト"""
+
+    def test_reconnection_variables_initialized(self):
+        """再接続関連変数が正しく初期化される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+
+            assert writer._last_successful_write_time == 0.0
+            assert writer._restart_threshold == 10.0
+            assert writer._restart_threshold_increment == 1.0
+            assert writer._restart_threshold_max == 20.0
+            assert writer._restart_wait_seconds == 5.0
+            assert writer._restart_lock is not None
+            assert writer._monitor_thread is None
+
+            writer.stop()
+
+    def test_has_monitor_and_restart_methods(self):
+        """_monitor_write_updatesと_restart_connectionメソッドが存在する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+
+            assert hasattr(writer, "_monitor_write_updates")
+            assert callable(writer._monitor_write_updates)
+            assert hasattr(writer, "_restart_connection")
+            assert callable(writer._restart_connection)
+
+            writer.stop()
+
+    def test_last_successful_write_time_updated_on_mux(self):
+        """mux成功時に_last_successful_write_timeが更新される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+
+            # 最初のフレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(1280, 720)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+
+            time.sleep(2.0)
+
+            # mux成功後、_last_successful_write_timeが0.0より大きくなる
+            assert writer._last_successful_write_time > 0.0
+
+            writer.stop()
+
+    def test_write_frames_loop_breaks_when_container_none(self):
+        """container=Noneで_write_framesループが終了する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+
+            # フレームを送信してスレッド起動
+            frame = create_test_video_frame(1280, 720)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+
+            # containerをNoneに設定
+            writer.container = None
+
+            # スレッドが終了するのを待つ
+            writer._thread.join(timeout=5.0)
+            assert not writer._thread.is_alive()
+
+            writer.stop()
+
+    def test_restart_connection_recreates_container_and_thread(self):
+        """_restart_connectionがコンテナとスレッドを再作成する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_restart_direct.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            # 監視スレッドが先に_restart_connectionを呼ばないよう閾値を高く設定
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+
+            # フレームを送信してスレッド起動を待つ
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            assert writer.container is not None
+            old_thread = writer._thread
+            old_container = writer.container
+
+            # _restart_connectionは内部でcontainer=None設定→旧スレッドjoin→
+            # queue.getでフレーム待ちするため、遅延供給スレッドでフレームを投入する
+            # （先にenqueueすると_write_framesに消費されてしまう）
+            def delayed_feed():
+                time.sleep(1.0)
+                f = create_test_video_frame(640, 480)
+                f.frame.pts = 0
+                f.frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(f)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            # _restart_connectionを直接呼び出す（フレーム取得までブロック）
+            writer._restart_connection()
+
+            # 再作成されたことを検証
+            assert writer.container is not None, "再接続後のcontainerがNoneです"
+            assert writer.container is not old_container, "containerが再作成されていません"
+            assert writer._thread is not None, "再接続後のスレッドがNoneです"
+            assert writer._thread.is_alive(), "再接続後のスレッドが動作していません"
+            assert writer._thread is not old_thread, "スレッドが再作成されていません"
+
+            # 再接続後にフレームを送信してmux成功を確認
+            write_time_before = writer._last_successful_write_time
+            for i in range(5):
+                f = create_test_video_frame(640, 480)
+                f.frame.pts = (i + 1) * 3000
+                f.frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(f)
+
+            time.sleep(2.0)
+            assert writer._last_successful_write_time > write_time_before, \
+                "再接続後にmuxが成功していません"
+
+            writer.stop()
+
+    def test_monitor_triggers_restart_on_write_stall(self):
+        """フレーム供給停止後、監視スレッドが再接続をトリガーし書き込みが再開する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_monitor_restart.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            # 閾値を短くしてテストを高速化
+            # __init__後すぐに設定（start_processingはフレーム待ちでブロック中）
+            writer._restart_threshold = 3.0
+            writer._restart_wait_seconds = 0.1
+            writer._restart_threshold_max = 20.0
+
+            # フェーズ1: 正常にフレームを送信してmux成功を確認
+            for i in range(10):
+                frame = create_test_video_frame(640, 480)
+                frame.frame.pts = i * 3000
+                frame.frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(frame)
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            assert writer._last_successful_write_time > 0.0
+            old_thread = writer._thread
+            initial_threshold = writer._restart_threshold  # 3.0
+
+            # フェーズ2: フレーム供給を停止（Listener死亡シミュレーション）
+            # 閾値3秒 + 監視間隔1秒 = 最大4秒で検知
+            # _restart_connectionがqueue.getでフレームを待つため、遅延供給する
+            def delayed_feed():
+                # _restart_connectionがqueue.get()に到達する頃にフレームを投入
+                # 検知(~4秒) + join(~即座) + wait(0.1秒) = ~4.5秒後
+                time.sleep(5.0)
+                for i in range(10):
+                    f = create_test_video_frame(640, 480)
+                    f.frame.pts = i * 3000
+                    f.frame.time_base = Fraction(1, 90000)
+                    writer.enqueue_video_frame(f)
+                    time.sleep(0.05)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            # フェーズ3: 再接続完了を待つ
+            # 検知(~4秒) + wait(0.1秒) + フレーム供給(5秒) + 起動 = ~8秒
+            time.sleep(9.0)
+
+            # 再接続が発生したことを検証
+            assert writer._restart_threshold > initial_threshold, \
+                f"閾値が増加していません: {writer._restart_threshold} (初期値: {initial_threshold})"
+            assert writer.container is not None, "再接続後のcontainerがNoneです"
+            assert writer._thread is not None, "再接続後のスレッドがNoneです"
+            assert writer._thread.is_alive(), "再接続後のスレッドが動作していません"
+            assert writer._thread is not old_thread, "スレッドが再作成されていません"
+
+            writer.stop()
+
+
+class TestStreamWriterReconnectionScenarios:
+    """StreamWriter再接続: 実障害シナリオテスト
+
+    PTS巻き戻し・コンテナ破損など、実際のListener再接続で発生する
+    障害パターンを再現し、StreamWriterの再接続機構を検証する。
+    """
+
+    def _create_pts_video_frame(
+        self, width: int, height: int, pts: int, time_base: Fraction = Fraction(1, 90000)
+    ) -> WrappedVideoFrame:
+        """PTS付きテスト用映像フレームを作成"""
+        frame = av.VideoFrame(width, height, "yuv420p")
+        for plane in frame.planes:
+            data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+            plane.update(data)
+        frame.pts = pts
+        frame.time_base = time_base
+        return WrappedVideoFrame(frame)
+
+    def _create_pts_audio_frame(
+        self, pts: int, sample_rate: int = 48000, time_base: Fraction = Fraction(1, 90000)
+    ) -> WrappedAudioFrame:
+        """PTS付きテスト用音声フレームを作成"""
+        audio_data = np.zeros((2, 1024), dtype=np.float32)
+        frame = av.AudioFrame.from_ndarray(audio_data, format="fltp", layout="stereo")
+        frame.sample_rate = sample_rate
+        frame.pts = pts
+        frame.time_base = time_base
+        return WrappedAudioFrame(frame)
+
+    def test_pts_reset_triggers_reconnection_and_resumes_writing(self):
+        """シナリオ1: PTS巻き戻し->muxエラー連続->監視検知->再接続->正常mux再開"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_pts_reset_reconnect.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 3.0
+            writer._restart_wait_seconds = 0.1
+
+            # フェーズ1: 正常なフレーム(PTS=0,3000,...,27000)を送信
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            assert writer._last_successful_write_time > 0.0
+            old_thread = writer._thread
+
+            # フェーズ2: PTS=0にリセットしたフレームを大量送信(muxエラー連続)
+            for i in range(20):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+                time.sleep(0.05)
+
+            # フェーズ3: 監視スレッドが検知->再接続を待つ
+            # 閾値3秒 + 監視間隔1秒 + wait0.1秒 + フレーム待ち
+            # 再接続後のフレームも供給する
+            def delayed_feed():
+                time.sleep(5.0)
+                for i in range(10):
+                    writer.enqueue_video_frame(
+                        self._create_pts_video_frame(640, 480, i * 3000)
+                    )
+                    time.sleep(0.05)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            time.sleep(9.0)
+
+            # 再接続が発生したことを検証
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            assert writer._thread is not old_thread, "スレッドが再作成されていません"
+            assert writer._restart_threshold > 3.0, "閾値が増加していません"
+
+            writer.stop()
+
+    def test_pts_reset_video_and_audio_triggers_reconnection(self):
+        """シナリオ2: 映像+音声両方のPTS巻き戻し->再接続->両方正常化"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_pts_reset_av.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 3.0
+            writer._restart_wait_seconds = 0.1
+
+            # フェーズ1: 映像+音声を正常送信
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+                writer.enqueue_audio_frame(
+                    self._create_pts_audio_frame(i * 1920)
+                )
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            old_thread = writer._thread
+
+            # フェーズ2: 映像・音声ともPTS=0にリセット(muxエラー)
+            for i in range(20):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+                writer.enqueue_audio_frame(
+                    self._create_pts_audio_frame(i * 1920)
+                )
+                time.sleep(0.05)
+
+            # フェーズ3: 再接続後のフレーム供給
+            def delayed_feed():
+                time.sleep(5.0)
+                for i in range(10):
+                    writer.enqueue_video_frame(
+                        self._create_pts_video_frame(640, 480, i * 3000)
+                    )
+                    writer.enqueue_audio_frame(
+                        self._create_pts_audio_frame(i * 1920)
+                    )
+                    time.sleep(0.05)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            time.sleep(9.0)
+
+            # 再接続が発生したことを検証
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            assert writer._thread is not old_thread, "スレッドが再作成されていません"
+
+            # 再接続後にmuxが成功していること
+            write_time_after_reconnect = writer._last_successful_write_time
+            assert write_time_after_reconnect > 0.0
+
+            writer.stop()
+
+    def test_mux_error_stops_updating_last_successful_write_time(self):
+        """シナリオ3: PTS巻き戻しmuxエラー中に_last_successful_write_timeが更新停止"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_mux_error_time.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            # 監視スレッドによる再接続を抑制
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+
+            # フェーズ1: 正常フレーム送信
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+
+            time.sleep(2.0)
+            assert writer._last_successful_write_time > 0.0
+            time_after_normal = writer._last_successful_write_time
+
+            # フェーズ2: PTS巻き戻しフレーム送信(muxエラー)
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+
+            time.sleep(2.0)
+            time_after_reset = writer._last_successful_write_time
+
+            # muxエラー中は_last_successful_write_timeが更新されないことを確認
+            # (全く同じか、ほぼ変わらないはず)
+            assert abs(time_after_reset - time_after_normal) < 1.0, \
+                f"muxエラー中に_last_successful_write_timeが更新されています: " \
+                f"正常後={time_after_normal}, リセット後={time_after_reset}"
+
+            writer.stop()
+
+    def test_reconnection_while_frames_continuously_supplied(self):
+        """シナリオ4: 再接続中もフレーム供給が継続する場合"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_reconnect_continuous.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+
+            # フレーム送信してスレッド起動
+            writer.enqueue_video_frame(
+                self._create_pts_video_frame(640, 480, 0)
+            )
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+
+            # バックグラウンドでフレーム供給を継続
+            supply_running = threading.Event()
+            supply_running.set()
+
+            def continuous_supply():
+                i = 0
+                while supply_running.is_set():
+                    writer.enqueue_video_frame(
+                        self._create_pts_video_frame(640, 480, i * 3000)
+                    )
+                    i += 1
+                    time.sleep(0.05)
+
+            supplier = threading.Thread(target=continuous_supply, daemon=True)
+            supplier.start()
+
+            # 再接続を直接呼び出し
+            writer._restart_connection()
+
+            # 再接続完了後、フレームが処理されることを確認
+            write_time_before = writer._last_successful_write_time
+            time.sleep(2.0)
+            assert writer._last_successful_write_time > write_time_before, \
+                "再接続後にmuxが成功していません"
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+
+            supply_running.clear()
+            writer.stop()
+
+    def test_threshold_increments_after_reconnection(self):
+        """シナリオ5: 再接続のたびに閾値が段階的に増加する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_threshold_increment.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 3.0
+            writer._restart_wait_seconds = 0.1
+
+            initial_threshold = writer._restart_threshold  # 3.0
+
+            # フレーム送信してスレッド起動
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            old_thread = writer._thread
+
+            # PTS巻き戻しで再接続をトリガー(フレーム供給停止)
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+
+            # 再接続後のフレーム供給
+            def delayed_feed():
+                time.sleep(5.0)
+                for i in range(10):
+                    writer.enqueue_video_frame(
+                        self._create_pts_video_frame(640, 480, i * 3000)
+                    )
+                    time.sleep(0.05)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            time.sleep(9.0)
+
+            # 閾値が増加していることを確認
+            expected_threshold = initial_threshold + writer._restart_threshold_increment
+            assert writer._restart_threshold >= expected_threshold, \
+                f"閾値が増加していません: 現在={writer._restart_threshold}, " \
+                f"期待>={expected_threshold}"
+            assert writer._thread is not old_thread, "スレッドが再作成されていません"
+
+            writer.stop()
+
+    def test_double_pts_reset_two_reconnections_succeed(self):
+        """シナリオ6: 2回連続PTS巻き戻し->2回再接続成功"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_double_reconnect.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+
+            initial_threshold = writer._restart_threshold
+
+            # フレーム送信してスレッド起動
+            writer.enqueue_video_frame(
+                self._create_pts_video_frame(640, 480, 0)
+            )
+            time.sleep(2.0)
+            assert writer._thread is not None
+            first_thread = writer._thread
+
+            # 1回目の再接続(遅延供給あり)
+            def feed_for_restart():
+                time.sleep(1.0)
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, 0)
+                )
+
+            feeder1 = threading.Thread(target=feed_for_restart, daemon=True)
+            feeder1.start()
+            writer._restart_connection()
+
+            second_thread = writer._thread
+            assert second_thread is not first_thread, "1回目の再接続でスレッドが変更されていません"
+
+            # 正常なフレームを処理
+            for i in range(5):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, (i + 1) * 3000)
+                )
+            time.sleep(1.0)
+
+            # 2回目の再接続
+            feeder2 = threading.Thread(target=feed_for_restart, daemon=True)
+            feeder2.start()
+            writer._restart_connection()
+
+            third_thread = writer._thread
+            assert third_thread is not second_thread, "2回目の再接続でスレッドが変更されていません"
+            assert third_thread is not first_thread, "3つ目のスレッドが最初のスレッドと同一です"
+
+            # 再接続後のmux成功確認
+            write_time_before = writer._last_successful_write_time
+            for i in range(5):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, (i + 1) * 3000)
+                )
+            time.sleep(2.0)
+            assert writer._last_successful_write_time > write_time_before
+
+            writer.stop()
+
+    def test_stop_during_reconnection_no_deadlock(self):
+        """シナリオ7: 再接続中にstop()呼び出し->デッドロックしない"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_stop_deadlock.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+
+            # フレーム送信してスレッド起動
+            writer.enqueue_video_frame(
+                self._create_pts_video_frame(640, 480, 0)
+            )
+            time.sleep(2.0)
+            assert writer._thread is not None
+
+            # バックグラウンドで_restart_connectionを呼ぶ(フレーム未供給->getでブロック)
+            restart_thread = threading.Thread(
+                target=writer._restart_connection, daemon=True
+            )
+            restart_thread.start()
+            time.sleep(0.5)  # restartがqueue.getでブロックされるのを待つ
+
+            # メインスレッドからstop()を呼ぶ
+            stop_start = time.monotonic()
+            writer.stop()
+            stop_elapsed = time.monotonic() - stop_start
+
+            # 5秒以内にstop()が完了すること(デッドロックしない)
+            assert stop_elapsed < 5.0, \
+                f"stop()が{stop_elapsed:.1f}秒かかりました(デッドロックの可能性)"
+
+            # restart_threadも終了していることを確認
+            restart_thread.join(timeout=3.0)
+            assert not restart_thread.is_alive(), "再接続スレッドが終了していません"
+
+    def test_container_forced_close_triggers_reconnection(self):
+        """シナリオ8: containerが外部から強制close->mux失敗->再接続"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_forced_close.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 3.0
+            writer._restart_wait_seconds = 0.1
+
+            # フレーム送信してスレッド起動
+            for i in range(10):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, i * 3000)
+                )
+
+            time.sleep(2.0)
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            old_thread = writer._thread
+
+            # 外部からcontainerを強制close
+            if writer.container is not None:
+                try:
+                    writer.container.close()
+                except Exception:
+                    pass
+
+            # mux失敗が継続するようフレームを供給し続ける
+            for i in range(20):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, (i + 10) * 3000)
+                )
+                time.sleep(0.05)
+
+            # 再接続後のフレーム供給
+            def delayed_feed():
+                time.sleep(5.0)
+                for i in range(10):
+                    writer.enqueue_video_frame(
+                        self._create_pts_video_frame(640, 480, i * 3000)
+                    )
+                    time.sleep(0.05)
+
+            feeder = threading.Thread(target=delayed_feed, daemon=True)
+            feeder.start()
+
+            time.sleep(9.0)
+
+            # 再接続が発生したことを検証
+            assert writer._thread is not None
+            assert writer._thread.is_alive()
+            assert writer._thread is not old_thread, "スレッドが再作成されていません"
+
+            writer.stop()
+
+    def test_reconnection_resets_pacing_clock(self):
+        """シナリオ9: 再接続後にペーシング基準時刻がリセットされる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_pacing_reset.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+
+            # PTS=90000(1秒)のフレームで初期化
+            writer.enqueue_video_frame(
+                self._create_pts_video_frame(640, 480, 90000)
+            )
+            time.sleep(2.0)
+
+            # _pts_originが1.0秒であることを確認
+            assert abs(writer._pts_origin - 1.0) < 0.01, \
+                f"初期_pts_originが期待値と異なります: {writer._pts_origin}"
+            old_wall_clock = writer._wall_clock_origin
+
+            # 再接続を実行(PTS=0のフレームを供給)
+            def feed_for_restart():
+                time.sleep(1.0)
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, 0)
+                )
+
+            feeder = threading.Thread(target=feed_for_restart, daemon=True)
+            feeder.start()
+            writer._restart_connection()
+
+            # 再接続後の新フレーム処理を待つ
+            time.sleep(2.0)
+
+            # ペーシング基準が再設定されたことを確認
+            assert abs(writer._pts_origin - 0.0) < 0.01, \
+                f"再接続後の_pts_originが0.0にリセットされていません: {writer._pts_origin}"
+            assert writer._wall_clock_origin > old_wall_clock, \
+                "_wall_clock_originが再設定されていません"
+
+            writer.stop()
+
+    def test_output_valid_after_reconnection(self):
+        """シナリオ10: 再接続後の出力ファイルが有効"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_valid_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+            writer._restart_threshold = 999.0
+            writer._restart_threshold_max = 9999.0
+            writer._restart_wait_seconds = 0.1
+
+            # 正常フレームを送信
+            writer.enqueue_video_frame(
+                self._create_pts_video_frame(640, 480, 0)
+            )
+            time.sleep(2.0)
+
+            # 再接続を直接呼び出し
+            def feed_for_restart():
+                time.sleep(1.0)
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, 0)
+                )
+
+            feeder = threading.Thread(target=feed_for_restart, daemon=True)
+            feeder.start()
+            writer._restart_connection()
+
+            # 再接続後に新PTS系列でフレーム送信
+            for i in range(30):
+                writer.enqueue_video_frame(
+                    self._create_pts_video_frame(640, 480, (i + 1) * 3000)
+                )
+                time.sleep(0.033)
+
+            time.sleep(2.0)
+            writer.stop()
+
+            # 出力ファイルが有効であることを確認
+            assert output_file.exists(), "出力ファイルが存在しません"
+            assert output_file.stat().st_size > 0, "出力ファイルのサイズが0です"
+
+            # ffprobeでPTSが単調増加していることを確認
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "packet=pts",
+                    "-of", "csv=p=0",
+                    str(output_file),
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            if result.stdout.strip():
+                pts_values = []
+                for line in result.stdout.strip().split("\n"):
+                    line = line.strip()
+                    if line and line != "N/A":
+                        try:
+                            pts_values.append(int(line))
+                        except ValueError:
+                            continue
+
+                if len(pts_values) > 1:
+                    # PTSが単調増加(非減少)であることを確認
+                    for i in range(1, len(pts_values)):
+                        assert pts_values[i] >= pts_values[i - 1], \
+                            f"PTSが単調増加していません: [{i-1}]={pts_values[i-1]}, [{i}]={pts_values[i]}"
