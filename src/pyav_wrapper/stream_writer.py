@@ -69,6 +69,10 @@ class StreamWriter:
         # 古いフレームの保持（フレームが取得できない場合の再利用用）
         self._last_video_frame: "WrappedVideoFrame | None" = None
 
+        # リアルタイムペーシング用
+        self._wall_clock_origin: float = 0.0
+        self._pts_origin: float = 0.0
+
         # 自動起動
         self.start()
 
@@ -184,9 +188,41 @@ class StreamWriter:
         except Exception as e:
             return f"処理開始エラー: {str(e)}"
 
+    def _init_realtime_clock(self, frame: av.VideoFrame) -> None:
+        """リアルタイムペーシングの基準時刻を設定する
+
+        Args:
+            frame: 最初の映像フレーム（PTS/time_baseから基準再生時刻を算出）
+        """
+        self._wall_clock_origin = time.monotonic()
+        if frame.pts is not None and frame.time_base is not None:
+            self._pts_origin = float(frame.pts * frame.time_base)
+        else:
+            self._pts_origin = 0.0
+
+    def _pace_frame(self, frame: av.VideoFrame) -> None:
+        """PTSに基づき壁時計とアラインメントするためスリープする
+
+        Args:
+            frame: ペーシング対象の映像フレーム
+        """
+        if frame.pts is None or frame.time_base is None:
+            return
+
+        frame_time_sec = float(frame.pts * frame.time_base)
+        target_elapsed = frame_time_sec - self._pts_origin
+        actual_elapsed = time.monotonic() - self._wall_clock_origin
+        sleep_duration = target_elapsed - actual_elapsed
+
+        if sleep_duration > 0:
+            time.sleep(min(sleep_duration, 1.0))
+
     def _write_frames(self) -> None:
         """エンコード・送信ループ (StreamListenerの_read_framesに対応)"""
         try:
+            # リアルタイムペーシングの基準時刻を設定
+            self._init_realtime_clock(self._first_frame.frame)
+
             # 最初のフレームを処理（元のPTSをそのまま使用）
             for packet in self._video_stream.encode(self._first_frame.frame):
                 self.container.mux(packet)
@@ -198,6 +234,7 @@ class StreamWriter:
                 wrapped_frame = self._process_video_frame()
                 if wrapped_frame is not None:
                     has_data = True
+                    self._pace_frame(wrapped_frame.frame)
                     # 元のPTSとtime_baseをそのまま使用
                     for packet in self._video_stream.encode(wrapped_frame.frame):
                         self.container.mux(packet)

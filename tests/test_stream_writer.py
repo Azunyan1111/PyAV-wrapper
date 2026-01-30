@@ -525,6 +525,141 @@ class TestStreamWriterFileOutput:
         print(f"映像duration: {result2.stdout.strip()}")
 
 
+class TestStreamWriterRealtime:
+    """StreamWriterリアルタイムペーシング機能のテスト"""
+
+    def test_init_realtime_clock_sets_origin(self):
+        """_init_realtime_clockが基準時刻を正しく設定する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            writer.stop()
+
+            # PTSとtime_baseを設定したフレームで基準時刻を初期化
+            from fractions import Fraction
+
+            frame = av.VideoFrame(1280, 720, "yuv420p")
+            frame.pts = 90000
+            frame.time_base = Fraction(1, 90000)
+
+            before = time.monotonic()
+            writer._init_realtime_clock(frame)
+            after = time.monotonic()
+
+            # _wall_clock_originがbefore〜afterの範囲内であること
+            assert before <= writer._wall_clock_origin <= after
+            # _pts_originが1.0秒であること（90000 * 1/90000）
+            assert abs(writer._pts_origin - 1.0) < 0.001
+
+    def test_init_realtime_clock_pts_none(self):
+        """_init_realtime_clockでPTSがNoneの場合、_pts_originが0.0になる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            writer.stop()
+
+            frame = av.VideoFrame(1280, 720, "yuv420p")
+            frame.pts = None
+
+            writer._init_realtime_clock(frame)
+            assert writer._pts_origin == 0.0
+
+    def test_pace_frame_returns_immediately_when_pts_none(self):
+        """PTSがNoneの場合、_pace_frameが即座にreturnする"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            writer.stop()
+
+            frame = av.VideoFrame(1280, 720, "yuv420p")
+            frame.pts = None
+
+            start = time.monotonic()
+            writer._pace_frame(frame)
+            elapsed = time.monotonic() - start
+
+            assert elapsed < 0.01
+
+    def test_pace_frame_sleeps_when_ahead(self):
+        """フレームが壁時計より先行している場合、_pace_frameがスリープする"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            writer.stop()
+
+            from fractions import Fraction
+
+            # 基準フレーム（PTS=0）で初期化
+            first_frame = av.VideoFrame(1280, 720, "yuv420p")
+            first_frame.pts = 0
+            first_frame.time_base = Fraction(1, 90000)
+            writer._init_realtime_clock(first_frame)
+
+            # 0.2秒先のフレーム（PTS=18000, time_base=1/90000 → 0.2秒）
+            future_frame = av.VideoFrame(1280, 720, "yuv420p")
+            future_frame.pts = 18000
+            future_frame.time_base = Fraction(1, 90000)
+
+            start = time.monotonic()
+            writer._pace_frame(future_frame)
+            elapsed = time.monotonic() - start
+
+            # 約0.2秒スリープすること（許容: 0.15〜0.35秒）
+            assert 0.15 <= elapsed <= 0.35
+
+    def test_pace_frame_max_sleep_capped_at_1_second(self):
+        """PTS不連続の場合、スリープが最大1秒に制限される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "test_output.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=1280,
+                height=720,
+                fps=30,
+            )
+            writer.stop()
+
+            from fractions import Fraction
+
+            # 基準フレーム（PTS=0）
+            first_frame = av.VideoFrame(1280, 720, "yuv420p")
+            first_frame.pts = 0
+            first_frame.time_base = Fraction(1, 90000)
+            writer._init_realtime_clock(first_frame)
+
+            # 100秒先のフレーム（PTS=9000000）
+            far_future_frame = av.VideoFrame(1280, 720, "yuv420p")
+            far_future_frame.pts = 9000000
+            far_future_frame.time_base = Fraction(1, 90000)
+
+            start = time.monotonic()
+            writer._pace_frame(far_future_frame)
+            elapsed = time.monotonic() - start
+
+            # 最大1秒に制限されること（許容: 0.9〜1.2秒）
+            assert 0.9 <= elapsed <= 1.2
+
+
 class TestStreamWriterLastFrameReuse:
     """古いフレーム再利用機能のテスト"""
 
