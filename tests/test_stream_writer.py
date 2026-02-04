@@ -230,7 +230,7 @@ class TestStreamWriterWithListenerIntegration:
         duration = 10.0
 
         # StreamListenerでSRTストリームを受信
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
 
         time.sleep(1.0)
 
@@ -321,7 +321,7 @@ class TestStreamWriterWithListenerIntegration:
         duration = 10.0
 
         # StreamListenerでSRTストリームを受信
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
 
         time.sleep(1.0)
 
@@ -435,7 +435,7 @@ class TestStreamWriterFileOutput:
         output_file = Path(__file__).parent / "output_stream_writer.ts"
         duration = 10.0
 
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         time.sleep(1.0)
 
         # 最初の映像フレームを取得

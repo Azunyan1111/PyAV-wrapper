@@ -12,22 +12,38 @@ from pyav_wrapper.video_frame import WrappedVideoFrame
 class StreamListener:
     """PyAVでストリームを受信し、Video/Audioフレームをバッファリングするクラス"""
 
-    def __init__(self, url: str, width: int | None = None, height: int | None = None):
+    def __init__(
+        self,
+        url: str,
+        width: int,
+        height: int,
+        fps: int = 30,
+        sample_rate: int = 48000,
+        audio_layout: str = "stereo",
+    ):
         """
         Args:
             url: 任意のストリームURL（srt://, rtmp://, udp://等）
-            width: 出力幅（リサイズ用、Noneで元サイズ維持）
-            height: 出力高さ（リサイズ用、Noneで元サイズ維持）
+            width: 出力幅（リサイズ用）
+            height: 出力高さ（リサイズ用）
+            fps: 想定フレームレート（保持用）
+            sample_rate: 想定音声サンプルレート（保持用）
+            audio_layout: 想定音声チャンネルレイアウト（保持用）
         """
+        if width is None or height is None:
+            raise ValueError("widthとheightは必須です")
         self.url = url
         self.width = width
         self.height = height
+        self.fps = fps
+        self.sample_rate = sample_rate
+        self.audio_layout = audio_layout
         self.is_running = False
         self.container: av.Container | None = None
         self._read_thread: threading.Thread | None = None
 
         # Video
-        self.batch_size = 30
+        self.batch_size = fps
         self.video_queue: collections.deque[WrappedVideoFrame] = collections.deque(
             maxlen=int(self.batch_size * 1.7)
         )
@@ -36,9 +52,11 @@ class StreamListener:
         self.current_frame: WrappedVideoFrame | None = None
 
         # Audio
-        self.audio_queue: collections.deque[WrappedAudioFrame] = collections.deque(
-            maxlen=int(self.batch_size * 1.7)
-        )
+        self.batch_size_audio = self.sample_rate
+        self._audio_batch_samples = self.sample_rate
+        self._audio_queue_max_samples = int(self.sample_rate * 1.7)
+        self._audio_queue_samples = 0
+        self.audio_queue: collections.deque[WrappedAudioFrame] = collections.deque()
         self.audio_queue_lock = threading.Lock()
 
         # Reconnection
@@ -137,29 +155,51 @@ class StreamListener:
             )
             return return_frames
 
+    def _get_audio_frame_samples(self, frame: WrappedAudioFrame) -> int:
+        """AudioFrameのサンプル数を正規化して取得"""
+        samples = frame.frame.samples
+        if samples is None or samples <= 0:
+            return 0
+        return samples
+
     def append_audio_queue(self, frame: WrappedAudioFrame) -> None:
         """Audioキューにフレームを追加"""
         if frame is None:
             return
         with self.audio_queue_lock:
             try:
-                if len(self.audio_queue) >= self.audio_queue.maxlen:
-                    for _ in range(max(1, len(self.audio_queue) // 10)):
-                        self.audio_queue.pop()
+                samples = self._get_audio_frame_samples(frame)
+                while (
+                    self._audio_queue_samples + samples > self._audio_queue_max_samples
+                    and self.audio_queue
+                ):
+                    dropped_frame = self.audio_queue.popleft()
+                    dropped_samples = self._get_audio_frame_samples(dropped_frame)
+                    self._audio_queue_samples = max(
+                        0,
+                        self._audio_queue_samples - dropped_samples,
+                    )
                 self.audio_queue.append(frame)
+                self._audio_queue_samples += samples
             except Exception as e:
                 print(f"Audioキュー追加エラー: {repr(e)}")
 
     def pop_all_audio_queue(self) -> list[WrappedAudioFrame]:
         """Audioキューからバッチサイズ分のフレームを取り出す"""
         with self.audio_queue_lock:
-            if len(self.audio_queue) < self.batch_size:
+            if self._audio_queue_samples < self._audio_batch_samples:
                 return []
-            frames = list(self.audio_queue)
-            return_frames = frames[: self.batch_size]
-            self.audio_queue = collections.deque(
-                frames[self.batch_size :], maxlen=int(self.batch_size * 1.7)
-            )
+            return_frames: list[WrappedAudioFrame] = []
+            collected_samples = 0
+            while self.audio_queue and collected_samples < self._audio_batch_samples:
+                frame = self.audio_queue.popleft()
+                return_frames.append(frame)
+                samples = self._get_audio_frame_samples(frame)
+                collected_samples += samples
+                self._audio_queue_samples = max(
+                    0,
+                    self._audio_queue_samples - samples,
+                )
             return return_frames
 
     def stop(self) -> None:

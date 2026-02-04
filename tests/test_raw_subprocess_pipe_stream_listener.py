@@ -80,7 +80,7 @@ class TestRawSubprocessPipeStreamListenerIntegration:
     def test_receive_video_and_audio_from_pipe(self):
         """whep-clientからパイプ経由で映像・音声フレームを受信できる"""
         command = [WHEP_CLIENT_PATH, WHEP_URL]
-        listener = RawSubprocessPipeStreamListener(command=command)
+        listener = RawSubprocessPipeStreamListener(command=command, width=640, height=480)
 
         time.sleep(10.0)
 

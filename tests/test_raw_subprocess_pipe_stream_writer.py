@@ -102,7 +102,7 @@ class TestRawSubprocessPipeStreamWriterIntegration:
 
             # 2. WHEP受信開始
             listener_command = [WHEP_CLIENT_PATH, WHEP_URL]
-            listener = RawSubprocessPipeStreamListener(command=listener_command)
+            listener = RawSubprocessPipeStreamListener(command=listener_command, width=640, height=480)
             print(f"WHEP受信開始: {WHEP_URL}")
 
             # フレーム受信を待機

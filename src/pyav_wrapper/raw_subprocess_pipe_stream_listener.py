@@ -10,16 +10,34 @@ from pyav_wrapper.stream_listener import StreamListener
 class RawSubprocessPipeStreamListener(StreamListener):
     """サブプロセスのstdoutパイプからMKV形式のrawvideo+PCMを受信するStreamListener"""
 
-    def __init__(self, command: list[str], width: int | None = None, height: int | None = None):
+    def __init__(
+        self,
+        command: list[str],
+        width: int,
+        height: int,
+        fps: int = 30,
+        sample_rate: int = 48000,
+        audio_layout: str = "stereo",
+    ):
         """
         Args:
             command: 実行するコマンド（例: ["./deps/whep-client", "https://..."]）
-            width: 出力幅（リサイズ用、Noneで元サイズ維持）
-            height: 出力高さ（リサイズ用、Noneで元サイズ維持）
+            width: 出力幅（リサイズ用）
+            height: 出力高さ（リサイズ用）
+            fps: 想定フレームレート（保持用）
+            sample_rate: 想定音声サンプルレート（保持用）
+            audio_layout: 想定音声チャンネルレイアウト（保持用）
         """
         self._command = command
         self._process: subprocess.Popen | None = None
-        super().__init__(url="pipe:", width=width, height=height)
+        super().__init__(
+            url="pipe:",
+            width=width,
+            height=height,
+            fps=fps,
+            sample_rate=sample_rate,
+            audio_layout=audio_layout,
+        )
 
     def start_processing(self) -> str:
         """サブプロセスを起動し、stdoutパイプからストリーム処理を開始"""

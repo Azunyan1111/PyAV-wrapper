@@ -156,8 +156,7 @@ class TestStreamListenerAudioQueue:
             listener = StreamListener(str(test_file), width=640, height=480)
             time.sleep(2.0)
 
-            max_size = int(listener.batch_size * 1.7)
-            assert len(listener.audio_queue) <= max_size
+            assert listener._audio_queue_samples <= listener._audio_queue_max_samples
             listener.stop()
 
 
@@ -306,7 +305,7 @@ class TestStreamListenerSRTIntegration:
         output_path = Path(__file__).parent / "output_grayscale.mp4"
         duration = 10.0
 
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
 
         time.sleep(1.0)
 
@@ -431,7 +430,7 @@ class TestStreamListenerSRTIntegration:
         """SRTから受信→グレースケール変換→SRTへ送信"""
         duration = 10.0
 
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
 
         time.sleep(1.0)
 
@@ -551,7 +550,7 @@ class TestStreamListenerSRT:
 
     def test_srt_connect(self, srt_source_url):
         """SRTストリームに接続できる"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         time.sleep(3.0)
 
         assert listener.is_running is True
@@ -559,7 +558,7 @@ class TestStreamListenerSRT:
 
     def test_srt_receive_video_frames(self, srt_source_url):
         """SRTからVideoフレームを受信できる"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         time.sleep(5.0)
 
         assert len(listener.video_queue) > 0
@@ -567,7 +566,7 @@ class TestStreamListenerSRT:
 
     def test_srt_receive_audio_frames(self, srt_source_url):
         """SRTからAudioフレームを受信できる"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         time.sleep(5.0)
 
         assert len(listener.audio_queue) > 0
@@ -575,7 +574,7 @@ class TestStreamListenerSRT:
 
     def test_srt_pop_video_returns_wrapped_frame(self, srt_source_url):
         """SRTから取得したVideoフレームがWrappedVideoFrame型"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         listener.batch_size = 5
         time.sleep(5.0)
 
@@ -586,7 +585,7 @@ class TestStreamListenerSRT:
 
     def test_srt_pop_audio_returns_wrapped_frame(self, srt_source_url):
         """SRTから取得したAudioフレームがWrappedAudioFrame型"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         listener.batch_size = 5
         time.sleep(5.0)
 
@@ -597,7 +596,7 @@ class TestStreamListenerSRT:
 
     def test_srt_video_frame_has_valid_buffer(self, srt_source_url):
         """SRTから取得したVideoフレームのバッファが有効"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         time.sleep(5.0)
 
         if len(listener.video_queue) > 0:
@@ -610,7 +609,7 @@ class TestStreamListenerSRT:
 
     def test_srt_audio_frame_has_valid_buffer(self, srt_source_url):
         """SRTから取得したAudioフレームのバッファが有効"""
-        listener = StreamListener(srt_source_url)
+        listener = StreamListener(srt_source_url, width=640, height=480)
         time.sleep(5.0)
 
         if len(listener.audio_queue) > 0:

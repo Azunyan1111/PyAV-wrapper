@@ -23,7 +23,7 @@ class StreamWriter:
         url: str,
         width: int,
         height: int,
-        fps: int,
+        fps: int = 30,
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
     ) -> None:
@@ -36,6 +36,8 @@ class StreamWriter:
             sample_rate: 音声サンプルレート（デフォルト: 48000）
             audio_layout: 音声チャンネルレイアウト（デフォルト: "stereo"）
         """
+        if width is None or height is None:
+            raise ValueError("widthとheightは必須です")
         self.url = url
         self.width = width
         self.height = height
@@ -50,8 +52,9 @@ class StreamWriter:
         self.video_queue: queue.Queue[WrappedVideoFrame] = queue.Queue(
             maxsize=queue_size
         )
+        queue_size_audio = int(sample_rate * 1.7)
         self.audio_queue: queue.Queue[WrappedAudioFrame] = queue.Queue(
-            maxsize=queue_size
+            maxsize=queue_size_audio
         )
 
         # スレッド管理
@@ -161,7 +164,7 @@ class StreamWriter:
     def start_processing(self) -> str:
         """コンテナを初期化し、書き込みスレッドを開始"""
         try:
-            # 最初のフレームを待って解像度を取得
+            # 最初のフレームから情報を取得するので保存
             first_frame = None
             while first_frame is None:
                 try:
@@ -170,10 +173,6 @@ class StreamWriter:
                     continue
 
             self._first_frame = first_frame
-
-            # フレームから実際の解像度を取得
-            actual_width = first_frame.frame.width
-            actual_height = first_frame.frame.height
 
             # PyAVコンテナとストリームを初期化
             # ファイル出力の場合はformatを明示せず拡張子から自動判別
@@ -184,8 +183,8 @@ class StreamWriter:
                 self.container = av.open(self.url, mode="w")
 
             self._video_stream = self.container.add_stream("libx264", rate=self.fps)
-            self._video_stream.width = actual_width
-            self._video_stream.height = actual_height
+            self._video_stream.width = self.width
+            self._video_stream.height = self.height
             self._video_stream.pix_fmt = "yuv420p"
             self._video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
 

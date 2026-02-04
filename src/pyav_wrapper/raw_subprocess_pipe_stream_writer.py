@@ -13,13 +13,13 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
     """サブプロセスのstdinパイプへMKV形式のrawvideo+PCMを書き込むStreamWriter"""
 
     def __init__(
-        self,
-        command: list[str],
-        width: int,
-        height: int,
-        fps: int,
-        sample_rate: int = 48000,
-        audio_layout: str = "stereo",
+            self,
+            command: list[str],
+            width: int,
+            height: int,
+            fps: int = 30,
+            sample_rate: int = 48000,
+            audio_layout: str = "stereo",
     ):
         """
         Args:
@@ -54,10 +54,6 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
             self._first_frame = first_frame
 
-            # フレームから実際の解像度を取得
-            actual_width = first_frame.frame.width
-            actual_height = first_frame.frame.height
-
             # サブプロセスを起動
             self._process = subprocess.Popen(
                 self._command,
@@ -72,8 +68,8 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
             # rawvideo ストリーム追加
             self._video_stream = self.container.add_stream("rawvideo", rate=self.fps)
-            self._video_stream.width = actual_width
-            self._video_stream.height = actual_height
+            self._video_stream.width = self.width
+            self._video_stream.height = self.height
             self._video_stream.pix_fmt = "yuv420p"
 
             # pcm_s16le 音声ストリーム追加
@@ -151,17 +147,6 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         if not self.is_running:
             return False
 
-        # キューから次のフレームを取得して_first_frameに設定（タイムアウト付き）
-        first_frame = self._wait_for_first_frame(self._restart_frame_wait_timeout)
-        if first_frame is None:
-            return False
-
-        self._first_frame = first_frame
-
-        # フレームから実際の解像度を取得
-        actual_width = first_frame.frame.width
-        actual_height = first_frame.frame.height
-
         # 新しいサブプロセスを起動
         try:
             self._process = subprocess.Popen(
@@ -177,8 +162,8 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
             # rawvideo ストリーム追加
             self._video_stream = self.container.add_stream("rawvideo", rate=self.fps)
-            self._video_stream.width = actual_width
-            self._video_stream.height = actual_height
+            self._video_stream.width = self.width
+            self._video_stream.height = self.height
             self._video_stream.pix_fmt = "yuv420p"
 
             # pcm_s16le 音声ストリーム追加
