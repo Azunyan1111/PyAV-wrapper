@@ -9,12 +9,18 @@ import traceback
 
 import av
 
+from pyav_wrapper.audio_frame import WrappedAudioFrame
 from pyav_wrapper.stream_writer import (
     StreamWriter,
     _StreamWriterContainerProxy,
     _deserialize_audio_frame,
     _deserialize_video_frame,
+    _drop_if_full,
+    _put_with_drop,
+    _serialize_audio_frame,
+    _serialize_video_frame,
 )
+from pyav_wrapper.video_frame import WrappedVideoFrame
 
 DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_writer.log"
 
@@ -309,6 +315,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         self._process: subprocess.Popen | None = None
         self._stderr_log_path = stderr_log_path
         self._stderr_file = None
+        self._last_video_dimensions: tuple[int, int] | None = None
         super().__init__(
             url="pipe:",
             width=width,
@@ -327,6 +334,55 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
                   次回のプロセス起動時から有効。
         """
         self._stderr_log_path = path
+
+    def enqueue_video_frame(self, frame: WrappedVideoFrame) -> None:
+        """映像フレームをMPキューに追加（軽量化: ローカルキューは使用しない）
+
+        Args:
+            frame: 送信するWrappedVideoFrame
+        """
+        if self._video_mp_queue is None:
+            return
+
+        try:
+            self._last_video_dimensions = (frame.frame.width, frame.frame.height)
+        except Exception:
+            pass
+
+        try:
+            if not _drop_if_full(self._video_mp_queue, self._video_drop_count):
+                return
+            include_planes = True
+            if frame.is_bad_frame and self._worker_has_video_reference:
+                include_planes = False
+            payload = _serialize_video_frame(frame, include_planes=include_planes)
+            _put_with_drop(
+                self._video_mp_queue,
+                payload,
+                self._video_drop_count,
+            )
+        except Exception as e:
+            print(f"映像フレームをMPキューに追加中にエラー: {repr(e)}")
+
+    def enqueue_audio_frame(self, frame: WrappedAudioFrame) -> None:
+        """音声フレームをMPキューに追加（軽量化: ローカルキューは使用しない）
+
+        Args:
+            frame: 送信するWrappedAudioFrame
+        """
+        if self._audio_mp_queue is None:
+            return
+        try:
+            if not _drop_if_full(self._audio_mp_queue, self._audio_drop_count):
+                return
+            payload = _serialize_audio_frame(frame)
+            _put_with_drop(
+                self._audio_mp_queue,
+                payload,
+                self._audio_drop_count,
+            )
+        except Exception as e:
+            print(f"音声フレームをMPキューに追加中にエラー: {repr(e)}")
 
     def _open_stderr_file(self):
         """stderrログファイルを開く"""
@@ -416,4 +472,41 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         Returns:
             bool: 再接続に成功した場合True、失敗した場合False
         """
-        return super()._restart_connection()
+        if not self.is_running:
+            return False
+
+        old_container = self.container
+        self.container = None
+        if old_container:
+            try:
+                old_container.close()
+            except Exception:
+                pass
+
+        if self._write_process is not None:
+            self._stop_write_process()
+        elif self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+        if not self.is_running:
+            return False
+
+        self._interruptible_sleep(self._restart_wait_seconds)
+
+        if not self.is_running:
+            return False
+
+        self._clear_mp_queue(self._video_mp_queue)
+        self._clear_mp_queue(self._audio_mp_queue)
+        self._clear_local_queues()
+
+        width = self.width
+        height = self.height
+        if self._last_video_dimensions is not None:
+            width, height = self._last_video_dimensions
+
+        self._last_successful_write_time = time.time()
+        self._start_write_process(width=width, height=height)
+        print("RawSubprocessPipeStreamWriter再接続を開始しました")
+        return True
