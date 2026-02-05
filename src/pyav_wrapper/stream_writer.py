@@ -26,6 +26,7 @@ class StreamWriter:
         fps: int = 30,
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
+        stats_enabled: bool = False,
     ) -> None:
         """
         Args:
@@ -35,6 +36,7 @@ class StreamWriter:
             fps: 出力フレームレート
             sample_rate: 音声サンプルレート（デフォルト: 48000）
             audio_layout: 音声チャンネルレイアウト（デフォルト: "stereo"）
+            stats_enabled: FPS統計出力を有効にするかどうか
         """
         if width is None or height is None:
             raise ValueError("widthとheightは必須です")
@@ -86,6 +88,12 @@ class StreamWriter:
         self._restart_frame_wait_timeout: float = 30.0
         self._restart_lock: threading.Lock = threading.Lock()
         self._monitor_thread: threading.Thread | None = None
+
+        # FPS統計
+        self._stats_enabled = stats_enabled
+        self._stats_video_frame_count: int = 0
+        self._stats_audio_frame_count: int = 0
+        self._stats_last_time: float = time.monotonic()
 
         # 自動起動
         self.start()
@@ -240,6 +248,7 @@ class StreamWriter:
             for packet in self._video_stream.encode(self._first_frame.frame):
                 self.container.mux(packet)
             self._last_successful_write_time = time.time()
+            self._stats_video_frame_count += 1
 
             while self.is_running:
                 if self.container is None:
@@ -257,6 +266,7 @@ class StreamWriter:
                         for packet in self._video_stream.encode(wrapped_frame.frame):
                             self.container.mux(packet)
                         self._last_successful_write_time = time.time()
+                        self._stats_video_frame_count += 1
                     except Exception as e:
                         print(f"StreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
@@ -271,6 +281,7 @@ class StreamWriter:
                         for packet in self._audio_stream.encode(wrapped_audio.frame):
                             self.container.mux(packet)
                         self._last_successful_write_time = time.time()
+                        self._stats_audio_frame_count += 1
                     except Exception as e:
                         print(f"StreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
 
@@ -328,6 +339,18 @@ class StreamWriter:
                         os._exit(1)
                     self._restart_connection()
                     # _restart_connectionがFalseを返した場合もループを継続し再試行する
+
+            # FPS統計出力
+            if self._stats_enabled:
+                now = time.monotonic()
+                stats_elapsed = now - self._stats_last_time
+                if stats_elapsed >= 5.0:
+                    video_fps = self._stats_video_frame_count / stats_elapsed
+                    audio_fps = self._stats_audio_frame_count / stats_elapsed
+                    print(f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}")
+                    self._stats_video_frame_count = 0
+                    self._stats_audio_frame_count = 0
+                    self._stats_last_time = now
 
     def _interruptible_sleep(self, seconds: float) -> None:
         """is_runningチェック付きスリープ。0.5秒間隔で分割。"""

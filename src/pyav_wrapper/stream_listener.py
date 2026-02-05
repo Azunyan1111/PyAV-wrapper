@@ -181,6 +181,7 @@ class StreamListener:
         fps: int = 30,
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
+        stats_enabled: bool = False,
     ):
         """
         Args:
@@ -190,6 +191,7 @@ class StreamListener:
             fps: 想定フレームレート（保持用）
             sample_rate: 想定音声サンプルレート（保持用）
             audio_layout: 想定音声チャンネルレイアウト（保持用）
+            stats_enabled: FPS統計出力を有効にするかどうか
         """
         if width is None or height is None:
             raise ValueError("widthとheightは必須です")
@@ -240,6 +242,12 @@ class StreamListener:
         self._restart_requested = False
         self._restart_in_progress = False
         self._monitor_thread: threading.Thread | None = None
+
+        # FPS統計
+        self._stats_enabled = stats_enabled
+        self._stats_video_frame_count: int = 0
+        self._stats_audio_frame_count: int = 0
+        self._stats_last_time: float = time.monotonic()
 
         self.start_processing()
 
@@ -374,7 +382,7 @@ class StreamListener:
             had_data |= self._drain_audio_queue()
 
             if not had_data:
-                time.sleep(0.005)
+                time.sleep(1.0)
 
             if not self.is_running:
                 break
@@ -390,6 +398,18 @@ class StreamListener:
                     f"(閾値: {self._restart_threshold:.1f}秒)"
                 )
                 self._force_restart()
+
+            # FPS統計出力
+            if self._stats_enabled:
+                now = time.monotonic()
+                stats_elapsed = now - self._stats_last_time
+                if stats_elapsed >= 5.0:
+                    video_fps = self._stats_video_frame_count / stats_elapsed
+                    audio_fps = self._stats_audio_frame_count / stats_elapsed
+                    print(f"[Listener] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}")
+                    self._stats_video_frame_count = 0
+                    self._stats_audio_frame_count = 0
+                    self._stats_last_time = now
 
     def _monitor_frame_updates(self) -> None:
         """互換性のためのラッパー。旧メソッド名で監視ループを起動する。"""
@@ -412,6 +432,7 @@ class StreamListener:
                 self.current_frame = wrapped
             self.append_video_queue(wrapped)
             self._last_successful_read_time = time.time()
+            self._stats_video_frame_count += 1
             drained = True
         return drained
 
@@ -430,6 +451,7 @@ class StreamListener:
             wrapped = self._deserialize_audio_frame(payload)
             self.append_audio_queue(wrapped)
             self._last_successful_read_time = time.time()
+            self._stats_audio_frame_count += 1
             drained = True
         return drained
 
