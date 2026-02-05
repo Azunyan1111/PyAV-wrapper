@@ -22,6 +22,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             fps: int = 30,
             sample_rate: int = 48000,
             audio_layout: str = "stereo",
+            stats_enabled: bool = False,
             stderr_log_path: str | None = None,
     ):
         """
@@ -32,6 +33,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             fps: 出力フレームレート
             sample_rate: 音声サンプルレート（デフォルト: 48000）
             audio_layout: 音声チャンネルレイアウト（デフォルト: "stereo"）
+            stats_enabled: FPS統計出力を有効にするかどうか
             stderr_log_path: サブプロセスのstderr出力先ファイルパス
                             Noneの場合は出力しない
         """
@@ -46,7 +48,9 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             fps=fps,
             sample_rate=sample_rate,
             audio_layout=audio_layout,
+            stats_enabled=stats_enabled,
         )
+        self._close_mp_queues()
 
     def set_stderr_log_path(self, path: str | None) -> None:
         """サブプロセスのstderr出力先ファイルパスを設定する

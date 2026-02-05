@@ -23,7 +23,7 @@ SRT等のストリーム受信・加工・送信を、PTS/time_baseなどのメ�
 ### StreamWriter
 - `WrappedVideoFrame`/`WrappedAudioFrame`をSRTまたはファイルへ送信
 - 元のPTS/time_baseを維持したままエンコード
-- リアルタイムペーシングと再接続
+- 再接続（ペーシングは外部で実施することを想定）
 
 ### RawSubprocessPipeStreamListener / RawSubprocessPipeStreamWriter
 - サブプロセスのstdout/stdinパイプをMatroska（MKV）として扱う派生クラス

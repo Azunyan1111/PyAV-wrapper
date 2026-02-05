@@ -1,7 +1,6 @@
 import os
 import time
 from pyav_wrapper import RawSubprocessPipeStreamListener, RawSubprocessPipeStreamWriter
-import random
 import threading
 
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.v2")
@@ -49,6 +48,7 @@ def main() -> None:
         width=1600,
         height=900,
         fps=30,
+        stats_enabled=True,
     )
     print("WHIP writer started.")
 
@@ -68,13 +68,10 @@ def main() -> None:
     t = time.time()
 
 
-    while True:
+    for i in range(60*30):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
-            # 50%の確率でフレームをスキップして送信しない
-            if random.random() < 0.5:
-                vf.is_bad_frame = True
             writer.enqueue_video_frame(vf)
         if len(video_frames) > 0:
             # 両方の一番最初のフレームのタイムスタンプを表示
@@ -87,7 +84,16 @@ def main() -> None:
         # start = time.perf_counter()
         # while time.perf_counter() - start < 1.0:
         #     pass
-        time.sleep(1)
+        # 99% of the time holding GIL, 1% releasing GIL
+        end = time.perf_counter() + 1.0
+        while time.perf_counter() < end:
+            # 約10ms GILを握る
+            start = time.perf_counter()
+            while time.perf_counter() - start < 0.01:
+                pass
+            # 約1msだけGILを解放
+            time.sleep(1/1000)
+        # time.sleep(1/30)
 
     # 6. 終了
     writer.stop()

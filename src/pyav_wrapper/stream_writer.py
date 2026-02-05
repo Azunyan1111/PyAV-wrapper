@@ -33,7 +33,7 @@ def _serialize_frame_common(frame: "av.frame.Frame") -> dict[str, Any]:
         "time_base": time_base,
     }
     opaque = frame.opaque
-    if _is_picklable(opaque):
+    if opaque is not None and _is_picklable(opaque):
         payload["opaque"] = opaque
     return payload
 
@@ -46,12 +46,15 @@ def _is_picklable(value: Any) -> bool:
         return False
 
 
-def _serialize_video_frame(frame: WrappedVideoFrame) -> dict[str, Any]:
-    planes: list[np.ndarray] = []
-    for plane in frame.frame.planes:
-        buffer = np.frombuffer(plane, dtype=np.uint8)
-        buffer = buffer.reshape(plane.height, plane.line_size)[:, : plane.width]
-        planes.append(buffer.copy())
+def _serialize_video_frame(
+    frame: WrappedVideoFrame,
+    include_planes: bool = True,
+) -> dict[str, Any]:
+    planes: list[bytes] | None = None
+    if include_planes:
+        planes = []
+        for plane in frame.frame.planes:
+            planes.append(bytes(plane))
 
     payload = _serialize_frame_common(frame.frame)
     payload.update(
@@ -128,7 +131,13 @@ def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
     _apply_common_frame_attrs(frame, payload)
     _apply_video_frame_attrs(frame, payload)
     wrapped = WrappedVideoFrame(frame)
-    wrapped.set_planes(payload["planes"])
+    planes = payload.get("planes")
+    if planes is not None:
+        for i, plane_data in enumerate(planes):
+            try:
+                frame.planes[i].update(plane_data)
+            except Exception:
+                continue
     wrapped.is_bad_frame = payload.get("is_bad_frame", False)
     return wrapped
 
@@ -166,6 +175,34 @@ def _put_with_drop(
         return
 
 
+def _drop_if_full(
+    target_queue: multiprocessing.Queue,
+    drop_count: int,
+) -> bool:
+    try:
+        if not target_queue.full():
+            return True
+    except NotImplementedError:
+        return True
+    except (ValueError, OSError):
+        return False
+
+    for _ in range(drop_count):
+        try:
+            target_queue.get_nowait()
+        except queue.Empty:
+            break
+        except (ValueError, OSError):
+            return False
+
+    try:
+        return not target_queue.full()
+    except NotImplementedError:
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 class _StreamWriterContainerProxy:
     def __init__(self, on_close) -> None:
         self._on_close = on_close
@@ -200,12 +237,13 @@ def _stream_writer_worker(
     audio_stream = None
     last_video_frame: WrappedVideoFrame | None = None
 
-    wall_clock_origin: float = 0.0
-    pts_origin: float = 0.0
-
     stats_video_frame_count: int = 0
     stats_audio_frame_count: int = 0
     stats_last_time: float = time.monotonic()
+    stats_status_last_time: float = time.monotonic()
+    pending_video_count: int = 0
+    pending_audio_count: int = 0
+    last_write_time: float | None = None
 
     def _notify_status(status: str, payload: dict[str, Any] | None = None) -> None:
         if status_queue is None:
@@ -218,25 +256,30 @@ def _stream_writer_worker(
         except Exception:
             pass
 
-    def _init_realtime_clock(frame: av.VideoFrame) -> None:
-        nonlocal wall_clock_origin, pts_origin
-        wall_clock_origin = time.monotonic()
-        if frame.pts is not None and frame.time_base is not None:
-            pts_origin = float(frame.pts * frame.time_base)
-        else:
-            pts_origin = 0.0
-
-    def _pace_frame(frame: av.VideoFrame) -> None:
-        if frame.pts is None or frame.time_base is None:
-            return
-
-        frame_time_sec = float(frame.pts * frame.time_base)
-        target_elapsed = frame_time_sec - pts_origin
-        actual_elapsed = time.monotonic() - wall_clock_origin
-        sleep_duration = target_elapsed - actual_elapsed
-
-        if sleep_duration > 0:
-            time.sleep(min(sleep_duration, 1.0))
+    def _flush_status_if_needed(force: bool = False) -> None:
+        nonlocal pending_video_count, pending_audio_count, stats_status_last_time, last_write_time
+        now = time.monotonic()
+        if not force:
+            if pending_video_count == 0 and pending_audio_count == 0:
+                return
+            if now - stats_status_last_time < 1.0:
+                return
+        if status_queue is not None:
+            message = {
+                "status": "write_stats",
+                "video_count": pending_video_count,
+                "audio_count": pending_audio_count,
+                "elapsed": now - stats_status_last_time,
+            }
+            if last_write_time is not None:
+                message["last_write_time"] = last_write_time
+            try:
+                status_queue.put_nowait(message)
+            except Exception:
+                pass
+        pending_video_count = 0
+        pending_audio_count = 0
+        stats_status_last_time = now
 
     def _wait_for_first_video_payload() -> dict[str, Any] | None:
         while not stop_event.is_set():
@@ -284,11 +327,11 @@ def _stream_writer_worker(
 
         try:
             container, video_stream, audio_stream = _open_container(width, height)
-            _init_realtime_clock(first_frame.frame)
             for packet in video_stream.encode(first_frame.frame):
                 container.mux(packet)
+            last_write_time = time.time()
             stats_video_frame_count += 1
-            _notify_status("started")
+            _notify_status("started", {"started_time": last_write_time})
         except Exception as e:
             _notify_status("error", {"message": str(e)})
             print(f"処理開始エラー: {str(e)}")
@@ -324,12 +367,12 @@ def _stream_writer_worker(
                     last_video_frame = wrapped_frame
 
                 has_data = True
-                _pace_frame(wrapped_frame.frame)
                 try:
                     for packet in video_stream.encode(wrapped_frame.frame):
                         container.mux(packet)
+                    last_write_time = time.time()
                     stats_video_frame_count += 1
-                    _notify_status("write_success", {"kind": "video"})
+                    pending_video_count += 1
                 except Exception as e:
                     print(f"StreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
@@ -344,13 +387,15 @@ def _stream_writer_worker(
                 try:
                     for packet in audio_stream.encode(wrapped_audio.frame):
                         container.mux(packet)
+                    last_write_time = time.time()
                     stats_audio_frame_count += 1
-                    _notify_status("write_success", {"kind": "audio"})
+                    pending_audio_count += 1
                 except Exception as e:
                     print(f"StreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
 
             if not has_data:
                 time.sleep(0.001)
+            _flush_status_if_needed()
 
             if stats_enabled:
                 now = time.monotonic()
@@ -367,6 +412,7 @@ def _stream_writer_worker(
         print(f"StreamWriter書き込みエラー: {e}", file=sys.stderr)
         traceback.print_exc()
     finally:
+        _flush_status_if_needed(force=True)
         if container is not None:
             try:
                 if video_stream is not None:
@@ -440,10 +486,6 @@ class StreamWriter:
         # 古いフレームの保持
         self._last_video_frame: WrappedVideoFrame | None = None
 
-        # リアルタイムペーシング用
-        self._wall_clock_origin: float = 0.0
-        self._pts_origin: float = 0.0
-
         # Reconnection
         self._last_successful_write_time: float = 0.0
         self._restart_threshold: float = 10.0
@@ -459,6 +501,9 @@ class StreamWriter:
         self._stats_video_frame_count: int = 0
         self._stats_audio_frame_count: int = 0
         self._stats_last_time: float = time.monotonic()
+        self._worker_has_video_reference = False
+        self._mp_video_fps: float | None = None
+        self._mp_audio_fps: float | None = None
 
         # multiprocessing
         self._mp_ctx = multiprocessing.get_context()
@@ -504,14 +549,42 @@ class StreamWriter:
                 break
             status = payload.get("status")
             if status == "write_success":
-                self._last_successful_write_time = time.time()
+                last_write_time = payload.get("last_write_time")
+                if last_write_time is not None:
+                    self._last_successful_write_time = last_write_time
+                else:
+                    self._last_successful_write_time = time.time()
                 kind = payload.get("kind")
                 if kind == "video":
                     self._stats_video_frame_count += 1
+                    self._worker_has_video_reference = True
                 elif kind == "audio":
                     self._stats_audio_frame_count += 1
+            elif status == "write_stats":
+                video_count = payload.get("video_count", 0)
+                audio_count = payload.get("audio_count", 0)
+                elapsed = payload.get("elapsed")
+                last_write_time = payload.get("last_write_time")
+                if last_write_time is not None:
+                    self._last_successful_write_time = last_write_time
+                elif video_count or audio_count:
+                    self._last_successful_write_time = time.time()
+                if video_count:
+                    self._stats_video_frame_count += video_count
+                    self._worker_has_video_reference = True
+                if audio_count:
+                    self._stats_audio_frame_count += audio_count
+                if elapsed:
+                    if video_count:
+                        self._mp_video_fps = video_count / elapsed
+                    if audio_count:
+                        self._mp_audio_fps = audio_count / elapsed
             elif status == "started":
-                self._last_successful_write_time = time.time()
+                started_time = payload.get("started_time")
+                if started_time is not None:
+                    self._last_successful_write_time = started_time
+                else:
+                    self._last_successful_write_time = time.time()
             elif status == "error":
                 message = payload.get("message")
                 if message:
@@ -550,7 +623,12 @@ class StreamWriter:
         if self._video_mp_queue is None:
             return
         try:
-            payload = _serialize_video_frame(frame)
+            if not _drop_if_full(self._video_mp_queue, self._video_drop_count):
+                return
+            include_planes = True
+            if frame.is_bad_frame and self._worker_has_video_reference:
+                include_planes = False
+            payload = _serialize_video_frame(frame, include_planes=include_planes)
             _put_with_drop(
                 self._video_mp_queue,
                 payload,
@@ -558,9 +636,6 @@ class StreamWriter:
             )
         except Exception as e:
             print(f"映像フレームをキューに追加中にエラー: {repr(e)}")
-
-        if self._wall_clock_origin == 0.0:
-            self._init_realtime_clock(frame.frame)
 
     def enqueue_video_frames(self, frames: list[WrappedVideoFrame]) -> None:
         """複数の映像フレームをキューに追加
@@ -596,6 +671,8 @@ class StreamWriter:
         if self._audio_mp_queue is None:
             return
         try:
+            if not _drop_if_full(self._audio_mp_queue, self._audio_drop_count):
+                return
             payload = _serialize_audio_frame(frame)
             _put_with_drop(
                 self._audio_mp_queue,
@@ -661,6 +738,7 @@ class StreamWriter:
     def _start_write_process(self, width: int | None = None, height: int | None = None) -> None:
         if not self.is_running:
             return
+        self._worker_has_video_reference = False
         if width is None:
             width = self.width
         if height is None:
@@ -768,43 +846,11 @@ class StreamWriter:
         if value is None and write_process is not None:
             self._stop_write_process()
 
-    def _init_realtime_clock(self, frame: av.VideoFrame) -> None:
-        """リアルタイムペーシングの基準時刻を設定する
-
-        Args:
-            frame: 最初の映像フレーム（PTS/time_baseから基準再生時刻を算出）
-        """
-        self._wall_clock_origin = time.monotonic()
-        if frame.pts is not None and frame.time_base is not None:
-            self._pts_origin = float(frame.pts * frame.time_base)
-        else:
-            self._pts_origin = 0.0
-
-    def _pace_frame(self, frame: av.VideoFrame) -> None:
-        """PTSに基づき壁時計とアラインメントするためスリープする
-
-        Args:
-            frame: ペーシング対象の映像フレーム
-        """
-        if frame.pts is None or frame.time_base is None:
-            return
-
-        frame_time_sec = float(frame.pts * frame.time_base)
-        target_elapsed = frame_time_sec - self._pts_origin
-        actual_elapsed = time.monotonic() - self._wall_clock_origin
-        sleep_duration = target_elapsed - actual_elapsed
-
-        if sleep_duration > 0:
-            time.sleep(min(sleep_duration, 1.0))
-
     def _write_frames(self) -> None:
         """エンコード・送信ループ (StreamListenerの_read_framesに対応)"""
         try:
             if self._first_frame is None:
                 return
-
-            # リアルタイムペーシングの基準時刻を設定
-            self._init_realtime_clock(self._first_frame.frame)
 
             # 最初のフレームを処理（元のPTSをそのまま使用）
             for packet in self._video_stream.encode(self._first_frame.frame):
@@ -822,7 +868,6 @@ class StreamWriter:
                 wrapped_frame = self._process_video_frame()
                 if wrapped_frame is not None:
                     has_data = True
-                    self._pace_frame(wrapped_frame.frame)
                     # 元のPTSとtime_baseをそのまま使用
                     try:
                         for packet in self._video_stream.encode(wrapped_frame.frame):
@@ -905,9 +950,26 @@ class StreamWriter:
                 if stats_elapsed >= 5.0:
                     video_fps = self._stats_video_frame_count / stats_elapsed
                     audio_fps = self._stats_audio_frame_count / stats_elapsed
-                    print(
-                        f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}"
-                    )
+                    if self._mp_video_fps is not None or self._mp_audio_fps is not None:
+                        mp_video_fps = (
+                            f"{self._mp_video_fps:.2f}"
+                            if self._mp_video_fps is not None
+                            else "N/A"
+                        )
+                        mp_audio_fps = (
+                            f"{self._mp_audio_fps:.2f}"
+                            if self._mp_audio_fps is not None
+                            else "N/A"
+                        )
+                        print(
+                            "[Writer] video_fps="
+                            f"{video_fps:.2f} audio_fps={audio_fps:.2f} "
+                            f"mp_video_fps={mp_video_fps} mp_audio_fps={mp_audio_fps}"
+                        )
+                    else:
+                        print(
+                            f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}"
+                        )
                     self._stats_video_frame_count = 0
                     self._stats_audio_frame_count = 0
                     self._stats_last_time = now
@@ -1019,7 +1081,6 @@ class StreamWriter:
             return False
 
         self._first_frame = first_frame
-        self._init_realtime_clock(first_frame.frame)
 
         # フレームから実際の解像度を取得
         actual_width = first_frame.frame.width
