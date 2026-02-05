@@ -231,6 +231,7 @@ def _stream_writer_worker(
     audio_queue: multiprocessing.Queue,
     status_queue: multiprocessing.Queue | None,
     control_queue: multiprocessing.Queue | None,
+    crop_ratio: float | None = None,
 ) -> None:
     container: av.Container | None = None
     video_stream = None
@@ -325,6 +326,10 @@ def _stream_writer_worker(
             return
         first_frame = _deserialize_video_frame(first_payload)
 
+        # クロップ設定がある場合は適用
+        if crop_ratio is not None:
+            first_frame = first_frame.crop_center(crop_ratio)
+
         try:
             container, video_stream, audio_stream = _open_container(width, height)
             for packet in video_stream.encode(first_frame.frame):
@@ -365,6 +370,10 @@ def _stream_writer_worker(
                         wrapped_frame.set_planes(last_planes)
                 else:
                     last_video_frame = wrapped_frame
+
+                # クロップ設定がある場合は適用
+                if crop_ratio is not None:
+                    wrapped_frame = wrapped_frame.crop_center(crop_ratio)
 
                 has_data = True
                 try:
@@ -498,6 +507,9 @@ class StreamWriter:
 
         # FPS統計
         self._stats_enabled = stats_enabled
+
+        # Crop設定
+        self._crop_ratio: float | None = None
         self._stats_video_frame_count: int = 0
         self._stats_audio_frame_count: int = 0
         self._stats_last_time: float = time.monotonic()
@@ -597,6 +609,16 @@ class StreamWriter:
             self._control_queue.put_nowait({"cmd": "close_container"})
         except Exception:
             pass
+
+    def set_crop_ratio(self, ratio: float | None) -> None:
+        """クロップ比率を設定
+
+        Args:
+            ratio: クロップ比率（0.0〜1.0）。Noneの場合はクロップしない。
+        """
+        if ratio is not None and not (0.0 < ratio <= 1.0):
+            raise ValueError(f"ratio must be between 0.0 and 1.0, got {ratio}")
+        self._crop_ratio = ratio
 
     def enqueue_video_frame(self, frame: WrappedVideoFrame) -> None:
         """映像フレームをキューに追加（ノンブロッキング）
@@ -781,6 +803,7 @@ class StreamWriter:
                 self._audio_mp_queue,
                 self._status_queue,
                 self._control_queue,
+                self._crop_ratio,
             ),
             daemon=True,
         )
@@ -852,8 +875,13 @@ class StreamWriter:
             if self._first_frame is None:
                 return
 
+            # クロップ設定がある場合は適用
+            first_frame = self._first_frame
+            if self._crop_ratio is not None:
+                first_frame = first_frame.crop_center(self._crop_ratio)
+
             # 最初のフレームを処理（元のPTSをそのまま使用）
-            for packet in self._video_stream.encode(self._first_frame.frame):
+            for packet in self._video_stream.encode(first_frame.frame):
                 self.container.mux(packet)
             self._last_successful_write_time = time.time()
             self._stats_video_frame_count += 1
@@ -867,6 +895,10 @@ class StreamWriter:
                 # 映像フレームの処理
                 wrapped_frame = self._process_video_frame()
                 if wrapped_frame is not None:
+                    # クロップ設定がある場合は適用
+                    if self._crop_ratio is not None:
+                        wrapped_frame = wrapped_frame.crop_center(self._crop_ratio)
+
                     has_data = True
                     # 元のPTSとtime_baseをそのまま使用
                     try:

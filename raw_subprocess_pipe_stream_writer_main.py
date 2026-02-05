@@ -50,6 +50,7 @@ def main() -> None:
         fps=30,
         stats_enabled=True,
     )
+    writer.set_crop_ratio(0.8)
     print("WHIP writer started.")
 
     # 音声は非同期で即座に送信する
@@ -85,15 +86,15 @@ def main() -> None:
         # while time.perf_counter() - start < 1.0:
         #     pass
         # 99% of the time holding GIL, 1% releasing GIL
-        end = time.perf_counter() + 1.0
-        while time.perf_counter() < end:
-            # 約10ms GILを握る
-            start = time.perf_counter()
-            while time.perf_counter() - start < 0.01:
-                pass
-            # 約1msだけGILを解放
-            time.sleep(1/1000)
-        # time.sleep(1/30)
+        # end = time.perf_counter() + 1.0
+        # while time.perf_counter() < end:
+        #     # 約10ms GILを握る
+        #     start = time.perf_counter()
+        #     while time.perf_counter() - start < 0.01:
+        #         pass
+        #     # 約1msだけGILを解放
+        #     time.sleep(1/1000)
+        time.sleep(1/30)
 
     # 6. 終了
     writer.stop()
