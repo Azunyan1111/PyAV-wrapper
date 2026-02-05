@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import traceback
+from multiprocessing import resource_tracker
 from multiprocessing import shared_memory
 from typing import Any
 
@@ -13,6 +14,12 @@ _SHM_TRACE_ENABLED = False
 _SHM_TRACE_RECORDS: dict[int, dict[str, Any]] = {}
 _SHM_TRACE_ORIGINALS: dict[str, Any] = {}
 _SHM_TRACE_SHOW_STACK = os.getenv("PYAV_WRAPPER_TRACE_SHM_STACK", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_SHM_TRACE_TRACK_REGISTER = os.getenv("PYAV_WRAPPER_TRACE_SHM_REGISTER", "").lower() in {
     "1",
     "true",
     "yes",
@@ -38,10 +45,14 @@ def enable_shared_memory_tracking() -> None:
         _SHM_TRACE_ORIGINALS["init"] = shared_memory.SharedMemory.__init__
         _SHM_TRACE_ORIGINALS["close"] = shared_memory.SharedMemory.close
         _SHM_TRACE_ORIGINALS["unlink"] = shared_memory.SharedMemory.unlink
+        _SHM_TRACE_ORIGINALS["rt_register"] = resource_tracker.register
+        _SHM_TRACE_ORIGINALS["rt_unregister"] = resource_tracker.unregister
 
         original_init = _SHM_TRACE_ORIGINALS["init"]
         original_close = _SHM_TRACE_ORIGINALS["close"]
         original_unlink = _SHM_TRACE_ORIGINALS["unlink"]
+        original_rt_register = _SHM_TRACE_ORIGINALS["rt_register"]
+        original_rt_unregister = _SHM_TRACE_ORIGINALS["rt_unregister"]
 
         def _tracked_init(self, *args, **kwargs):
             create = bool(kwargs.get("create", False))
@@ -112,6 +123,21 @@ def enable_shared_memory_tracking() -> None:
         shared_memory.SharedMemory.__init__ = _tracked_init
         shared_memory.SharedMemory.close = _tracked_close
         shared_memory.SharedMemory.unlink = _tracked_unlink
+
+        if _SHM_TRACE_TRACK_REGISTER:
+            def _tracked_rt_register(name, rtype):
+                if rtype == "shared_memory":
+                    _write_shm_trace(f"resource_tracker.register name={name}")
+                return original_rt_register(name, rtype)
+
+            def _tracked_rt_unregister(name, rtype):
+                if rtype == "shared_memory":
+                    _write_shm_trace(f"resource_tracker.unregister name={name}")
+                return original_rt_unregister(name, rtype)
+
+            resource_tracker.register = _tracked_rt_register
+            resource_tracker.unregister = _tracked_rt_unregister
+
         atexit.register(_dump_leftover_records)
         _SHM_TRACE_ENABLED = True
         _write_shm_trace("tracking enabled")

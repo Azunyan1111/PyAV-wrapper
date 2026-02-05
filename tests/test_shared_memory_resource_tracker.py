@@ -479,3 +479,26 @@ print("ok")
 
         result = self._run_child_script(child_script)
         self._assert_no_shared_memory_leak_warning(result)
+
+    def test_pack_exception_path_does_not_emit_warning(self):
+        child_script = """
+import multiprocessing as mp
+
+from pyav_wrapper import stream_writer as sw
+
+try:
+    mp.set_start_method("fork", force=True)
+except Exception:
+    pass
+
+# len()は通るがbuffer代入で失敗する値を混ぜて、shm書き込み例外経路を通す
+for _ in range(300):
+    packed = sw._pack_bytes_to_shared_memory([b"ok", [1, 2, 3]], threshold_bytes=1)
+    if packed is not None:
+        raise RuntimeError("expected None for invalid chunk")
+
+print("ok")
+"""
+
+        result = self._run_child_script(child_script)
+        self._assert_no_shared_memory_leak_warning(result)

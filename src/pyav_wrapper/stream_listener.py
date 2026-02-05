@@ -124,6 +124,7 @@ def _pack_bytes_to_shared_memory(
     except Exception:
         return None
 
+    shm_name = shm.name
     spans: list[tuple[int, int]] = []
     cursor = 0
     try:
@@ -132,7 +133,10 @@ def _pack_bytes_to_shared_memory(
             shm.buf[cursor: cursor + chunk_size] = chunk
             spans.append((cursor, chunk_size))
             cursor += chunk_size
-        shm_name = shm.name
+    except Exception:
+        _close_and_unlink_shared_memory(shm)
+        _unregister_created_shared_memory(shm_name)
+        return None
     finally:
         try:
             shm.close()
