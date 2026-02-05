@@ -1,5 +1,6 @@
 import av
 import numpy as np
+from typing import Any
 
 
 class WrappedVideoFrame:
@@ -8,6 +9,7 @@ class WrappedVideoFrame:
     def __init__(self, frame: av.VideoFrame):
         self._frame = frame
         self._is_bad_frame = False
+        self._serialized_payload: dict[str, Any] | None = None
 
     @property
     def frame(self) -> av.VideoFrame:
@@ -23,6 +25,14 @@ class WrappedVideoFrame:
     def is_bad_frame(self, value: bool) -> None:
         """フレームが不正かどうかを設定"""
         self._is_bad_frame = value
+
+    def set_serialized_payload(self, payload: dict[str, Any] | None) -> None:
+        """元のシリアライズ済みpayloadを保持する"""
+        self._serialized_payload = payload
+
+    def get_serialized_payload(self) -> dict[str, Any] | None:
+        """保持しているシリアライズ済みpayloadを取得する"""
+        return self._serialized_payload
 
     def get_buffer(self) -> np.ndarray:
         """フレーム全体のバッファをnumpy配列として取得
@@ -59,6 +69,7 @@ class WrappedVideoFrame:
             plane.update(padded.tobytes())
         else:
             plane.update(data.tobytes())
+        self._serialized_payload = None
 
     def get_planes(self) -> list[np.ndarray]:
         """各plane（Y, U, V等）を個別にnumpy配列として取得"""
@@ -87,6 +98,7 @@ class WrappedVideoFrame:
                 plane.update(padded.tobytes())
             else:
                 plane.update(data.tobytes())
+        self._serialized_payload = None
 
     def crop_center(self, ratio: float = 0.8) -> "WrappedVideoFrame":
         """中央からratioの割合でクロップした新しいWrappedVideoFrameを返す

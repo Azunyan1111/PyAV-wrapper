@@ -9,6 +9,7 @@ from pyav_wrapper.stream_listener import (
     _serialize_audio_frame,
     _serialize_video_frame,
 )
+from pyav_wrapper.video_frame import WrappedVideoFrame
 
 DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_listener.log"
 
@@ -25,6 +26,7 @@ def _raw_subprocess_pipe_decode_worker(
     start_timeout_seconds: float,
     start_retry_interval_seconds: float,
     stderr_log_path: str | None,
+    crop_ratio: float | None = None,
 ) -> None:
     process: subprocess.Popen | None = None
     container: av.container.Container | None = None
@@ -83,6 +85,8 @@ def _raw_subprocess_pipe_decode_worker(
                 if width is not None and height is not None:
                     if frame.width != width or frame.height != height:
                         frame = frame.reformat(width=width, height=height)
+                if crop_ratio is not None:
+                    frame = WrappedVideoFrame(frame).crop_center(crop_ratio).frame
                 payload = _serialize_video_frame(frame)
                 _put_with_drop(video_queue, payload, video_drop_count)
 
@@ -131,6 +135,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
         stderr_log_path: str | None = None,
+        crop_ratio: float | None = None,
     ):
         """
         Args:
@@ -142,6 +147,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
             audio_layout: 想定音声チャンネルレイアウト（保持用）
             stderr_log_path: サブプロセスのstderr出力先ファイルパス
                             Noneの場合は出力しない
+            crop_ratio: 受信時に適用するクロップ比率（0.0〜1.0）
         """
         self._command = command
         self._process: subprocess.Popen | None = None
@@ -156,6 +162,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
             fps=fps,
             sample_rate=sample_rate,
             audio_layout=audio_layout,
+            crop_ratio=crop_ratio,
         )
 
     def set_stderr_log_path(self, path: str | None) -> None:
@@ -184,6 +191,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
                 self._start_timeout_seconds,
                 self._start_retry_interval_seconds,
                 self._stderr_log_path,
+                self._crop_ratio,
             ),
             daemon=True,
         )

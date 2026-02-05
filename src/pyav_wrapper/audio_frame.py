@@ -1,5 +1,6 @@
 import av
 import numpy as np
+from typing import Any
 
 
 class WrappedAudioFrame:
@@ -7,11 +8,20 @@ class WrappedAudioFrame:
 
     def __init__(self, frame: av.AudioFrame):
         self._frame = frame
+        self._serialized_payload: dict[str, Any] | None = None
 
     @property
     def frame(self) -> av.AudioFrame:
         """元のAVFrameを取得"""
         return self._frame
+
+    def set_serialized_payload(self, payload: dict[str, Any] | None) -> None:
+        """元のシリアライズ済みpayloadを保持する"""
+        self._serialized_payload = payload
+
+    def get_serialized_payload(self) -> dict[str, Any] | None:
+        """保持しているシリアライズ済みpayloadを取得する"""
+        return self._serialized_payload
 
     def get_buffer(self) -> np.ndarray:
         """フレーム全体のバッファをnumpy配列として取得
@@ -38,6 +48,7 @@ class WrappedAudioFrame:
         # 各planeのデータを元のフレームにコピー
         for i, plane in enumerate(new_frame.planes):
             self._frame.planes[i].update(bytes(plane))
+        self._serialized_payload = None
 
     def get_planes(self) -> list[np.ndarray]:
         """各チャネルを個別にnumpy配列として取得（Planar形式用）"""
@@ -55,6 +66,7 @@ class WrappedAudioFrame:
         """各チャネルを個別に上書き"""
         for i, data in enumerate(planes):
             self._frame.planes[i].update(data.tobytes())
+        self._serialized_payload = None
 
     def _get_numpy_dtype(self) -> np.dtype:
         """AudioFrameのフォーマットに対応するnumpyのdtypeを取得"""

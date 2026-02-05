@@ -8,6 +8,7 @@ import pickle
 import queue
 import threading
 import time
+from multiprocessing import shared_memory
 from typing import Any
 
 import av
@@ -42,12 +43,79 @@ def _is_picklable(value: Any) -> bool:
         return False
 
 
+_SHM_VIDEO_THRESHOLD_BYTES = 1 << 60
+_SHM_AUDIO_THRESHOLD_BYTES = 1 << 60
+
+
+def _cleanup_payload_shared_memory(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    if payload.get("storage") != "shm":
+        return
+    shm_name = payload.get("shm_name")
+    if not isinstance(shm_name, str) or not shm_name:
+        return
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+    try:
+        shm.close()
+    except Exception:
+        pass
+    try:
+        shm.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _pack_bytes_to_shared_memory(
+    chunks: list[bytes],
+    threshold_bytes: int,
+) -> tuple[str, list[tuple[int, int]]] | None:
+    total_size = sum(len(chunk) for chunk in chunks)
+    if total_size < threshold_bytes:
+        return None
+    try:
+        shm = shared_memory.SharedMemory(create=True, size=total_size)
+    except Exception:
+        return None
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    try:
+        for chunk in chunks:
+            chunk_size = len(chunk)
+            shm.buf[cursor: cursor + chunk_size] = chunk
+            spans.append((cursor, chunk_size))
+            cursor += chunk_size
+        shm_name = shm.name
+    finally:
+        try:
+            shm.close()
+        except Exception:
+            pass
+
+    return shm_name, spans
+
+
 def _serialize_video_frame(frame: av.VideoFrame) -> dict[str, Any]:
-    planes: list[np.ndarray] = []
+    planes: list[bytes] | None = []
     for plane in frame.planes:
-        buffer = np.frombuffer(plane, dtype=np.uint8)
-        buffer = buffer.reshape(plane.height, plane.line_size)[:, : plane.width]
-        planes.append(buffer.copy())
+        planes.append(bytes(plane))
+
+    storage = "inline"
+    shm_name: str | None = None
+    plane_spans: list[tuple[int, int]] | None = None
+    shm_payload = _pack_bytes_to_shared_memory(planes, _SHM_VIDEO_THRESHOLD_BYTES)
+    if shm_payload is not None:
+        shm_name, plane_spans = shm_payload
+        planes = None
+        storage = "shm"
 
     payload = _serialize_frame_common(frame)
     payload.update(
@@ -56,6 +124,9 @@ def _serialize_video_frame(frame: av.VideoFrame) -> dict[str, Any]:
             "width": frame.width,
             "height": frame.height,
             "planes": planes,
+            "plane_spans": plane_spans,
+            "storage": storage,
+            "shm_name": shm_name,
             "pict_type": frame.pict_type,
             "colorspace": frame.colorspace,
             "color_range": frame.color_range,
@@ -65,9 +136,28 @@ def _serialize_video_frame(frame: av.VideoFrame) -> dict[str, Any]:
 
 
 def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
-    data = frame.to_ndarray()
+    data = np.ascontiguousarray(frame.to_ndarray())
+    raw_bytes = data.tobytes()
+    shm_payload = _pack_bytes_to_shared_memory([raw_bytes], _SHM_AUDIO_THRESHOLD_BYTES)
 
     payload = _serialize_frame_common(frame)
+    if shm_payload is None:
+        payload.update(
+            {
+                "format": frame.format.name,
+                "layout": frame.layout.name,
+                "sample_rate": frame.sample_rate,
+                "rate": frame.rate,
+                "samples": frame.samples,
+                "data": data,
+                "storage": "inline",
+                "shm_name": None,
+                "data_spans": None,
+            }
+        )
+        return payload
+
+    shm_name, data_spans = shm_payload
     payload.update(
         {
             "format": frame.format.name,
@@ -75,7 +165,12 @@ def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
             "sample_rate": frame.sample_rate,
             "rate": frame.rate,
             "samples": frame.samples,
-            "data": data,
+            "data": None,
+            "storage": "shm",
+            "shm_name": shm_name,
+            "data_spans": data_spans,
+            "data_shape": data.shape,
+            "data_dtype": str(data.dtype),
         }
     )
     return payload
@@ -92,14 +187,17 @@ def _put_with_drop(
     except queue.Full:
         for _ in range(drop_count):
             try:
-                target_queue.get_nowait()
+                dropped = target_queue.get_nowait()
+                _cleanup_payload_shared_memory(dropped)
             except queue.Empty:
                 break
         try:
             target_queue.put_nowait(item)
         except queue.Full:
+            _cleanup_payload_shared_memory(item)
             return
     except (ValueError, OSError):
+        _cleanup_payload_shared_memory(item)
         return
 
 
@@ -112,6 +210,7 @@ def _stream_listener_decode_worker(
     audio_queue: multiprocessing.Queue,
     video_drop_count: int,
     audio_drop_count: int,
+    crop_ratio: float | None = None,
 ) -> None:
     container: av.Container | None = None
     try:
@@ -140,6 +239,8 @@ def _stream_listener_decode_worker(
                 if width is not None and height is not None:
                     if frame.width != width or frame.height != height:
                         frame = frame.reformat(width=width, height=height)
+                if crop_ratio is not None:
+                    frame = WrappedVideoFrame(frame).crop_center(crop_ratio).frame
                 payload = _serialize_video_frame(frame)
                 _put_with_drop(video_queue, payload, video_drop_count)
 
@@ -184,6 +285,7 @@ class StreamListener:
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
         stats_enabled: bool = False,
+        crop_ratio: float | None = None,
     ):
         """
         Args:
@@ -194,9 +296,12 @@ class StreamListener:
             sample_rate: 想定音声サンプルレート（保持用）
             audio_layout: 想定音声チャンネルレイアウト（保持用）
             stats_enabled: FPS統計出力を有効にするかどうか
+            crop_ratio: 受信時に適用するクロップ比率（0.0〜1.0）
         """
         if width is None or height is None:
             raise ValueError("widthとheightは必須です")
+        if crop_ratio is not None and not (0.0 < crop_ratio <= 1.0):
+            raise ValueError(f"crop_ratio must be between 0.0 and 1.0, got {crop_ratio}")
         self.url = url
         self.width = width
         self.height = height
@@ -250,6 +355,7 @@ class StreamListener:
         self._stats_video_frame_count: int = 0
         self._stats_audio_frame_count: int = 0
         self._stats_last_time: float = time.monotonic()
+        self._crop_ratio: float | None = crop_ratio
 
         self.start_processing()
 
@@ -288,10 +394,25 @@ class StreamListener:
                 self._audio_mp_queue,
                 self._video_drop_count,
                 self._audio_drop_count,
+                self._crop_ratio,
             ),
             daemon=True,
         )
         self._read_thread.start()
+
+    def set_crop_ratio(self, ratio: float | None) -> None:
+        """受信時に適用するクロップ比率を設定
+
+        Args:
+            ratio: クロップ比率（0.0〜1.0）。Noneの場合はクロップしない。
+        """
+        if ratio is not None and not (0.0 < ratio <= 1.0):
+            raise ValueError(f"ratio must be between 0.0 and 1.0, got {ratio}")
+        if ratio == self._crop_ratio:
+            return
+        self._crop_ratio = ratio
+        if self.is_running:
+            self._request_restart()
 
     def _stop_read_process(self) -> None:
         if self._stop_event is not None:
@@ -328,10 +449,96 @@ class StreamListener:
         self._apply_common_frame_attrs(frame, payload)
         self._apply_video_frame_attrs(frame, payload)
         wrapped = WrappedVideoFrame(frame)
-        wrapped.set_planes(payload["planes"])
+        storage = payload.get("storage", "inline")
+        if storage == "shm":
+            shm_name = payload.get("shm_name")
+            plane_spans = payload.get("plane_spans")
+            if isinstance(shm_name, str) and isinstance(plane_spans, list):
+                shm = None
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    for i, span in enumerate(plane_spans):
+                        if not isinstance(span, (list, tuple)) or len(span) != 2:
+                            continue
+                        offset = int(span[0])
+                        size = int(span[1])
+                        try:
+                            frame.planes[i].update(shm.buf[offset: offset + size])
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                finally:
+                    if shm is not None:
+                        try:
+                            shm.close()
+                        except Exception:
+                            pass
+                        try:
+                            shm.unlink()
+                        except Exception:
+                            pass
+                    else:
+                        _cleanup_payload_shared_memory(payload)
+        else:
+            planes = payload.get("planes")
+            if planes is not None:
+                for i, plane_data in enumerate(planes):
+                    try:
+                        if isinstance(plane_data, np.ndarray):
+                            frame.planes[i].update(plane_data.tobytes())
+                        else:
+                            frame.planes[i].update(plane_data)
+                    except Exception:
+                        continue
+        wrapped.set_serialized_payload(payload)
         return wrapped
 
     def _deserialize_audio_frame(self, payload: dict[str, Any]) -> WrappedAudioFrame:
+        storage = payload.get("storage", "inline")
+        if storage == "shm":
+            shm_name = payload.get("shm_name")
+            data_spans = payload.get("data_spans")
+            data_shape = payload.get("data_shape")
+            data_dtype = payload.get("data_dtype")
+            if (
+                isinstance(shm_name, str)
+                and isinstance(data_spans, list)
+                and len(data_spans) > 0
+                and isinstance(data_shape, (list, tuple))
+                and isinstance(data_dtype, str)
+            ):
+                span = data_spans[0]
+                if isinstance(span, (list, tuple)) and len(span) == 2:
+                    offset = int(span[0])
+                    size = int(span[1])
+                    shm = None
+                    try:
+                        shm = shared_memory.SharedMemory(name=shm_name)
+                        raw = bytes(shm.buf[offset: offset + size])
+                        data = np.frombuffer(raw, dtype=np.dtype(data_dtype)).reshape(tuple(data_shape))
+                        frame = av.AudioFrame.from_ndarray(
+                            data,
+                            format=payload["format"],
+                            layout=payload["layout"],
+                        )
+                        self._apply_common_frame_attrs(frame, payload)
+                        self._apply_audio_frame_attrs(frame, payload)
+                        wrapped = WrappedAudioFrame(frame)
+                        wrapped.set_serialized_payload(payload)
+                        return wrapped
+                    finally:
+                        if shm is not None:
+                            try:
+                                shm.close()
+                            except Exception:
+                                pass
+                            try:
+                                shm.unlink()
+                            except Exception:
+                                pass
+                        else:
+                            _cleanup_payload_shared_memory(payload)
         frame = av.AudioFrame.from_ndarray(
             payload["data"],
             format=payload["format"],
@@ -339,7 +546,9 @@ class StreamListener:
         )
         self._apply_common_frame_attrs(frame, payload)
         self._apply_audio_frame_attrs(frame, payload)
-        return WrappedAudioFrame(frame)
+        wrapped = WrappedAudioFrame(frame)
+        wrapped.set_serialized_payload(payload)
+        return wrapped
 
     def _apply_common_frame_attrs(self, frame: "av.frame.Frame", payload: dict[str, Any]) -> None:
         for key in ("pts", "dts", "duration", "side_data", "opaque"):
@@ -475,11 +684,9 @@ class StreamListener:
         with self.video_queue_lock:
             if len(self.video_queue) < self.batch_size:
                 return []
-            frames = list(self.video_queue)
-            return_frames = frames[: self.batch_size]
-            self.video_queue = collections.deque(
-                frames[self.batch_size :], maxlen=int(self.batch_size * 1.7)
-            )
+            return_frames: list[WrappedVideoFrame] = []
+            for _ in range(self.batch_size):
+                return_frames.append(self.video_queue.popleft())
             return return_frames
 
     def _get_audio_frame_samples(self, frame: WrappedAudioFrame) -> int:

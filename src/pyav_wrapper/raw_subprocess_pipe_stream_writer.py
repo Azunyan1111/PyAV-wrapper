@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import collections
 import multiprocessing
 import queue
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -15,6 +17,7 @@ from pyav_wrapper.stream_writer import (
     _StreamWriterContainerProxy,
     _deserialize_audio_frame,
     _deserialize_video_frame,
+    _cleanup_payload_shared_memory,
     _drop_if_full,
     _put_with_drop,
     _serialize_audio_frame,
@@ -65,6 +68,7 @@ def _raw_subprocess_pipe_stream_writer_worker(
     pending_video_count: int = 0
     pending_audio_count: int = 0
     last_write_time: float | None = None
+    pending_video_payloads: collections.deque[dict[str, object]] = collections.deque()
 
     def _notify_status(status: str, payload: dict[str, object] | None = None) -> None:
         if status_queue is None:
@@ -102,13 +106,43 @@ def _raw_subprocess_pipe_stream_writer_worker(
         pending_audio_count = 0
         stats_status_last_time = now
 
+    def _iter_video_payloads(payload_obj: object):
+        if isinstance(payload_obj, dict):
+            yield payload_obj
+            return
+        if isinstance(payload_obj, list):
+            for item in payload_obj:
+                if isinstance(item, dict):
+                    yield item
+
+    def _get_video_payload(timeout: float) -> dict[str, object] | None:
+        if pending_video_payloads:
+            return pending_video_payloads.popleft()
+        try:
+            payload_obj = video_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        for payload in _iter_video_payloads(payload_obj):
+            pending_video_payloads.append(payload)
+        if pending_video_payloads:
+            return pending_video_payloads.popleft()
+        return None
+
     def _wait_for_first_video_payload():
         while not stop_event.is_set():
-            try:
-                return video_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            payload = _get_video_payload(timeout=1.0)
+            if payload is not None:
+                return payload
         return None
+
+    def _iter_audio_payloads(payload_obj: object):
+        if isinstance(payload_obj, dict):
+            yield payload_obj
+            return
+        if isinstance(payload_obj, list):
+            for item in payload_obj:
+                if isinstance(item, dict):
+                    yield item
 
     def _open_container():
         if process is None or process.stdin is None:
@@ -182,10 +216,7 @@ def _raw_subprocess_pipe_stream_writer_worker(
 
             has_data = False
 
-            try:
-                video_payload = video_queue.get(timeout=1 / 30)
-            except queue.Empty:
-                video_payload = None
+            video_payload = _get_video_payload(timeout=1 / 30)
 
             if video_payload is not None:
                 wrapped_frame = _deserialize_video_frame(video_payload)
@@ -211,20 +242,21 @@ def _raw_subprocess_pipe_stream_writer_worker(
 
             while True:
                 try:
-                    audio_payload = audio_queue.get_nowait()
+                    audio_payload_obj = audio_queue.get_nowait()
                 except queue.Empty:
                     break
 
-                wrapped_audio = _deserialize_audio_frame(audio_payload)
-                has_data = True
-                try:
-                    for packet in audio_stream.encode(wrapped_audio.frame):
-                        container.mux(packet)
-                    last_write_time = time.time()
-                    stats_audio_frame_count += 1
-                    pending_audio_count += 1
-                except Exception as e:
-                    print(f"RawSubprocessPipeStreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                for audio_payload in _iter_audio_payloads(audio_payload_obj):
+                    wrapped_audio = _deserialize_audio_frame(audio_payload)
+                    has_data = True
+                    try:
+                        for packet in audio_stream.encode(wrapped_audio.frame):
+                            container.mux(packet)
+                        last_write_time = time.time()
+                        stats_audio_frame_count += 1
+                        pending_audio_count += 1
+                    except Exception as e:
+                        print(f"RawSubprocessPipeStreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
 
             if not has_data:
                 time.sleep(0.001)
@@ -316,6 +348,12 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         self._stderr_log_path = stderr_log_path
         self._stderr_file = None
         self._last_video_dimensions: tuple[int, int] | None = None
+        self._pending_video_payloads: list[dict[str, object]] = []
+        self._video_payload_lock = threading.Lock()
+        self._video_payload_batch_size = 4
+        self._pending_audio_payloads: list[dict[str, object]] = []
+        self._audio_payload_lock = threading.Lock()
+        self._audio_payload_batch_size = 16
         super().__init__(
             url="pipe:",
             width=width,
@@ -335,6 +373,58 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         """
         self._stderr_log_path = path
 
+    def _flush_pending_video_payloads_locked(self, force: bool = False) -> None:
+        if self._video_mp_queue is None:
+            for payload in self._pending_video_payloads:
+                _cleanup_payload_shared_memory(payload)
+            self._pending_video_payloads.clear()
+            return
+        if not self._pending_video_payloads:
+            return
+        if not force and len(self._pending_video_payloads) < self._video_payload_batch_size:
+            return
+        if not _drop_if_full(self._video_mp_queue, self._video_drop_count):
+            return
+
+        payload_batch = self._pending_video_payloads.copy()
+        self._pending_video_payloads.clear()
+        outbound_payload: object
+        if len(payload_batch) == 1:
+            outbound_payload = payload_batch[0]
+        else:
+            outbound_payload = payload_batch
+        _put_with_drop(
+            self._video_mp_queue,
+            outbound_payload,
+            self._video_drop_count,
+        )
+
+    def _flush_pending_audio_payloads_locked(self, force: bool = False) -> None:
+        if self._audio_mp_queue is None:
+            for payload in self._pending_audio_payloads:
+                _cleanup_payload_shared_memory(payload)
+            self._pending_audio_payloads.clear()
+            return
+        if not self._pending_audio_payloads:
+            return
+        if not force and len(self._pending_audio_payloads) < self._audio_payload_batch_size:
+            return
+        if not _drop_if_full(self._audio_mp_queue, self._audio_drop_count):
+            return
+
+        payload_batch = self._pending_audio_payloads.copy()
+        self._pending_audio_payloads.clear()
+        outbound_payload: object
+        if len(payload_batch) == 1:
+            outbound_payload = payload_batch[0]
+        else:
+            outbound_payload = payload_batch
+        _put_with_drop(
+            self._audio_mp_queue,
+            outbound_payload,
+            self._audio_drop_count,
+        )
+
     def enqueue_video_frame(self, frame: WrappedVideoFrame) -> None:
         """映像フレームをMPキューに追加（軽量化: ローカルキューは使用しない）
 
@@ -350,17 +440,31 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             pass
 
         try:
-            if not _drop_if_full(self._video_mp_queue, self._video_drop_count):
-                return
-            include_planes = True
+            payload: dict[str, object]
+            cached_payload = frame.get_serialized_payload()
             if frame.is_bad_frame and self._worker_has_video_reference:
-                include_planes = False
-            payload = _serialize_video_frame(frame, include_planes=include_planes)
-            _put_with_drop(
-                self._video_mp_queue,
-                payload,
-                self._video_drop_count,
-            )
+                if cached_payload is not None:
+                    payload = dict(cached_payload)
+                else:
+                    payload = _serialize_video_frame(frame, include_planes=False)
+                payload["is_bad_frame"] = True
+                payload["planes"] = None
+                payload["plane_spans"] = None
+                payload["storage"] = "inline"
+                payload["shm_name"] = None
+            else:
+                if cached_payload is not None:
+                    payload = dict(cached_payload)
+                else:
+                    payload = _serialize_video_frame(frame, include_planes=True)
+                payload["is_bad_frame"] = frame.is_bad_frame
+
+            with self._video_payload_lock:
+                self._pending_video_payloads.append(payload)
+                if len(self._pending_video_payloads) >= self._video_payload_batch_size:
+                    self._flush_pending_video_payloads_locked(force=True)
+                elif len(self._pending_video_payloads) == 1 and not self._worker_has_video_reference:
+                    self._flush_pending_video_payloads_locked(force=True)
         except Exception as e:
             print(f"映像フレームをMPキューに追加中にエラー: {repr(e)}")
 
@@ -373,14 +477,15 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         if self._audio_mp_queue is None:
             return
         try:
-            if not _drop_if_full(self._audio_mp_queue, self._audio_drop_count):
-                return
-            payload = _serialize_audio_frame(frame)
-            _put_with_drop(
-                self._audio_mp_queue,
-                payload,
-                self._audio_drop_count,
-            )
+            cached_payload = frame.get_serialized_payload()
+            if cached_payload is not None:
+                payload = dict(cached_payload)
+            else:
+                payload = _serialize_audio_frame(frame)
+            with self._audio_payload_lock:
+                self._pending_audio_payloads.append(payload)
+                if len(self._pending_audio_payloads) >= self._audio_payload_batch_size:
+                    self._flush_pending_audio_payloads_locked(force=True)
         except Exception as e:
             print(f"音声フレームをMPキューに追加中にエラー: {repr(e)}")
 
@@ -462,6 +567,18 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
     def stop(self) -> None:
         """ストリーム処理とサブプロセスを停止"""
+        if hasattr(self, "_video_payload_lock"):
+            with self._video_payload_lock:
+                self._flush_pending_video_payloads_locked(force=True)
+                for payload in self._pending_video_payloads:
+                    _cleanup_payload_shared_memory(payload)
+                self._pending_video_payloads.clear()
+        if hasattr(self, "_audio_payload_lock"):
+            with self._audio_payload_lock:
+                self._flush_pending_audio_payloads_locked(force=True)
+                for payload in self._pending_audio_payloads:
+                    _cleanup_payload_shared_memory(payload)
+                self._pending_audio_payloads.clear()
         super().stop()
         self._process = None
         self._close_stderr_file()
@@ -474,6 +591,17 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         """
         if not self.is_running:
             return False
+
+        if hasattr(self, "_video_payload_lock"):
+            with self._video_payload_lock:
+                for payload in self._pending_video_payloads:
+                    _cleanup_payload_shared_memory(payload)
+                self._pending_video_payloads.clear()
+        if hasattr(self, "_audio_payload_lock"):
+            with self._audio_payload_lock:
+                for payload in self._pending_audio_payloads:
+                    _cleanup_payload_shared_memory(payload)
+                self._pending_audio_payloads.clear()
 
         old_container = self.container
         self.container = None

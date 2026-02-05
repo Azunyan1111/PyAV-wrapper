@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import pickle
 import queue
+from multiprocessing import shared_memory
 import sys
 import threading
 import time
@@ -46,15 +47,87 @@ def _is_picklable(value: Any) -> bool:
         return False
 
 
+_SHM_VIDEO_THRESHOLD_BYTES = 256 * 1024
+_SHM_AUDIO_THRESHOLD_BYTES = 64 * 1024
+
+
+def _cleanup_payload_shared_memory(payload: Any) -> None:
+    if isinstance(payload, list):
+        for item in payload:
+            _cleanup_payload_shared_memory(item)
+        return
+    if not isinstance(payload, dict):
+        return
+    if payload.get("storage") != "shm":
+        return
+    shm_name = payload.get("shm_name")
+    if not isinstance(shm_name, str) or not shm_name:
+        return
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+    try:
+        shm.close()
+    except Exception:
+        pass
+    try:
+        shm.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _pack_bytes_to_shared_memory(
+    chunks: list[bytes],
+    threshold_bytes: int,
+) -> tuple[str, list[tuple[int, int]]] | None:
+    total_size = sum(len(chunk) for chunk in chunks)
+    if total_size < threshold_bytes:
+        return None
+    try:
+        shm = shared_memory.SharedMemory(create=True, size=total_size)
+    except Exception:
+        return None
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    try:
+        for chunk in chunks:
+            chunk_size = len(chunk)
+            shm.buf[cursor: cursor + chunk_size] = chunk
+            spans.append((cursor, chunk_size))
+            cursor += chunk_size
+        shm_name = shm.name
+    finally:
+        try:
+            shm.close()
+        except Exception:
+            pass
+
+    return shm_name, spans
+
+
 def _serialize_video_frame(
     frame: WrappedVideoFrame,
     include_planes: bool = True,
 ) -> dict[str, Any]:
     planes: list[bytes] | None = None
+    plane_spans: list[tuple[int, int]] | None = None
+    shm_name: str | None = None
+    storage = "inline"
     if include_planes:
         planes = []
         for plane in frame.frame.planes:
             planes.append(bytes(plane))
+        shm_payload = _pack_bytes_to_shared_memory(planes, _SHM_VIDEO_THRESHOLD_BYTES)
+        if shm_payload is not None:
+            shm_name, plane_spans = shm_payload
+            planes = None
+            storage = "shm"
 
     payload = _serialize_frame_common(frame.frame)
     payload.update(
@@ -63,6 +136,9 @@ def _serialize_video_frame(
             "width": frame.frame.width,
             "height": frame.frame.height,
             "planes": planes,
+            "plane_spans": plane_spans,
+            "storage": storage,
+            "shm_name": shm_name,
             "pict_type": frame.frame.pict_type,
             "colorspace": frame.frame.colorspace,
             "color_range": frame.frame.color_range,
@@ -73,9 +149,32 @@ def _serialize_video_frame(
 
 
 def _serialize_audio_frame(frame: WrappedAudioFrame) -> dict[str, Any]:
-    data = frame.frame.to_ndarray()
+    data = np.ascontiguousarray(frame.frame.to_ndarray())
+    raw_bytes = data.tobytes()
+    shm_payload = _pack_bytes_to_shared_memory([raw_bytes], _SHM_AUDIO_THRESHOLD_BYTES)
+    storage = "inline"
+    shm_name: str | None = None
+    data_spans: list[tuple[int, int]] | None = None
 
     payload = _serialize_frame_common(frame.frame)
+    if shm_payload is None:
+        payload.update(
+            {
+                "format": frame.frame.format.name,
+                "layout": frame.frame.layout.name,
+                "sample_rate": frame.frame.sample_rate,
+                "rate": frame.frame.rate,
+                "samples": frame.frame.samples,
+                "data": data,
+                "storage": storage,
+                "shm_name": shm_name,
+                "data_spans": data_spans,
+            }
+        )
+        return payload
+
+    shm_name, data_spans = shm_payload
+    storage = "shm"
     payload.update(
         {
             "format": frame.frame.format.name,
@@ -83,7 +182,12 @@ def _serialize_audio_frame(frame: WrappedAudioFrame) -> dict[str, Any]:
             "sample_rate": frame.frame.sample_rate,
             "rate": frame.frame.rate,
             "samples": frame.frame.samples,
-            "data": data,
+            "data": None,
+            "storage": storage,
+            "shm_name": shm_name,
+            "data_spans": data_spans,
+            "data_shape": data.shape,
+            "data_dtype": str(data.dtype),
         }
     )
     return payload
@@ -131,18 +235,92 @@ def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
     _apply_common_frame_attrs(frame, payload)
     _apply_video_frame_attrs(frame, payload)
     wrapped = WrappedVideoFrame(frame)
-    planes = payload.get("planes")
-    if planes is not None:
-        for i, plane_data in enumerate(planes):
+    storage = payload.get("storage", "inline")
+    if storage == "shm":
+        shm_name = payload.get("shm_name")
+        plane_spans = payload.get("plane_spans")
+        if isinstance(shm_name, str) and isinstance(plane_spans, list):
+            shm = None
             try:
-                frame.planes[i].update(plane_data)
+                shm = shared_memory.SharedMemory(name=shm_name)
+                for i, span in enumerate(plane_spans):
+                    if not isinstance(span, (list, tuple)) or len(span) != 2:
+                        continue
+                    offset = int(span[0])
+                    size = int(span[1])
+                    try:
+                        frame.planes[i].update(shm.buf[offset: offset + size])
+                    except Exception:
+                        continue
             except Exception:
-                continue
+                pass
+            finally:
+                if shm is not None:
+                    try:
+                        shm.close()
+                    except Exception:
+                        pass
+                    try:
+                        shm.unlink()
+                    except Exception:
+                        pass
+                else:
+                    _cleanup_payload_shared_memory(payload)
+    else:
+        planes = payload.get("planes")
+        if planes is not None:
+            for i, plane_data in enumerate(planes):
+                try:
+                    frame.planes[i].update(plane_data)
+                except Exception:
+                    continue
     wrapped.is_bad_frame = payload.get("is_bad_frame", False)
     return wrapped
 
 
 def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
+    storage = payload.get("storage", "inline")
+    if storage == "shm":
+        shm_name = payload.get("shm_name")
+        data_spans = payload.get("data_spans")
+        data_shape = payload.get("data_shape")
+        data_dtype = payload.get("data_dtype")
+        if (
+            isinstance(shm_name, str)
+            and isinstance(data_spans, list)
+            and len(data_spans) > 0
+            and isinstance(data_shape, (list, tuple))
+            and isinstance(data_dtype, str)
+        ):
+            span = data_spans[0]
+            if isinstance(span, (list, tuple)) and len(span) == 2:
+                offset = int(span[0])
+                size = int(span[1])
+                shm = None
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    raw = bytes(shm.buf[offset: offset + size])
+                    data = np.frombuffer(raw, dtype=np.dtype(data_dtype)).reshape(tuple(data_shape))
+                    frame = av.AudioFrame.from_ndarray(
+                        data,
+                        format=payload["format"],
+                        layout=payload["layout"],
+                    )
+                    _apply_common_frame_attrs(frame, payload)
+                    _apply_audio_frame_attrs(frame, payload)
+                    return WrappedAudioFrame(frame)
+                finally:
+                    if shm is not None:
+                        try:
+                            shm.close()
+                        except Exception:
+                            pass
+                        try:
+                            shm.unlink()
+                        except Exception:
+                            pass
+                    else:
+                        _cleanup_payload_shared_memory(payload)
     frame = av.AudioFrame.from_ndarray(
         payload["data"],
         format=payload["format"],
@@ -155,7 +333,7 @@ def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
 
 def _put_with_drop(
     target_queue: multiprocessing.Queue,
-    item: dict[str, Any],
+    item: Any,
     drop_count: int,
 ) -> None:
     try:
@@ -164,14 +342,17 @@ def _put_with_drop(
     except queue.Full:
         for _ in range(drop_count):
             try:
-                target_queue.get_nowait()
+                dropped = target_queue.get_nowait()
+                _cleanup_payload_shared_memory(dropped)
             except queue.Empty:
                 break
         try:
             target_queue.put_nowait(item)
         except queue.Full:
+            _cleanup_payload_shared_memory(item)
             return
     except (ValueError, OSError):
+        _cleanup_payload_shared_memory(item)
         return
 
 
@@ -189,7 +370,8 @@ def _drop_if_full(
 
     for _ in range(drop_count):
         try:
-            target_queue.get_nowait()
+            dropped = target_queue.get_nowait()
+            _cleanup_payload_shared_memory(dropped)
         except queue.Empty:
             break
         except (ValueError, OSError):
@@ -668,6 +850,24 @@ class StreamWriter:
         for frame in frames:
             self.enqueue_video_frame(frame)
 
+    def enqueue_video_payload(self, payload: dict[str, Any]) -> None:
+        """シリアライズ済みの映像ペイロードを直接MPキューへ追加"""
+        if self._video_mp_queue is None:
+            _cleanup_payload_shared_memory(payload)
+            return
+        try:
+            if not _drop_if_full(self._video_mp_queue, self._video_drop_count):
+                _cleanup_payload_shared_memory(payload)
+                return
+            _put_with_drop(
+                self._video_mp_queue,
+                payload,
+                self._video_drop_count,
+            )
+        except Exception as e:
+            _cleanup_payload_shared_memory(payload)
+            print(f"映像ペイロードをMPキューに追加中にエラー: {repr(e)}")
+
     def enqueue_audio_frame(self, frame: WrappedAudioFrame) -> None:
         """音声フレームをキューに追加（ノンブロッキング）
 
@@ -712,6 +912,24 @@ class StreamWriter:
         """
         for frame in frames:
             self.enqueue_audio_frame(frame)
+
+    def enqueue_audio_payload(self, payload: dict[str, Any]) -> None:
+        """シリアライズ済みの音声ペイロードを直接MPキューへ追加"""
+        if self._audio_mp_queue is None:
+            _cleanup_payload_shared_memory(payload)
+            return
+        try:
+            if not _drop_if_full(self._audio_mp_queue, self._audio_drop_count):
+                _cleanup_payload_shared_memory(payload)
+                return
+            _put_with_drop(
+                self._audio_mp_queue,
+                payload,
+                self._audio_drop_count,
+            )
+        except Exception as e:
+            _cleanup_payload_shared_memory(payload)
+            print(f"音声ペイロードをMPキューに追加中にエラー: {repr(e)}")
 
     def start(self) -> None:
         """start_processing() をスレッドで起動するラッパー"""
@@ -827,6 +1045,7 @@ class StreamWriter:
     def _close_mp_queues(self) -> None:
         video_mp_queue = getattr(self, "_video_mp_queue", None)
         if video_mp_queue is not None:
+            self._clear_mp_queue(video_mp_queue)
             try:
                 video_mp_queue.cancel_join_thread()
                 video_mp_queue.close()
@@ -834,6 +1053,7 @@ class StreamWriter:
                 pass
         audio_mp_queue = getattr(self, "_audio_mp_queue", None)
         if audio_mp_queue is not None:
+            self._clear_mp_queue(audio_mp_queue)
             try:
                 audio_mp_queue.cancel_join_thread()
                 audio_mp_queue.close()
@@ -1037,9 +1257,13 @@ class StreamWriter:
     def _clear_mp_queue(self, target: multiprocessing.Queue | None) -> None:
         if target is None:
             return
+        reader = getattr(target, "_reader", None)
         while True:
             try:
-                target.get_nowait()
+                if reader is not None and not reader.poll():
+                    break
+                dropped = target.get_nowait()
+                _cleanup_payload_shared_memory(dropped)
             except queue.Empty:
                 break
             except (ValueError, OSError):
