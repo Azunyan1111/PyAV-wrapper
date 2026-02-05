@@ -66,6 +66,8 @@ def main() -> None:
 
     # 4. 継続的に中継（300秒間）
     t = time.time()
+
+
     while True:
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
@@ -81,6 +83,10 @@ def main() -> None:
             print(f"Sent frames in {time.time() - t:.4f} seconds.")
             t = time.time()
             print(f"Send Video Frame size: {len(video_frames)}")
+        # ここで一秒間GILに激しい処理を入れる
+        # start = time.perf_counter()
+        # while time.perf_counter() - start < 1.0:
+        #     pass
         time.sleep(1)
 
     # 6. 終了

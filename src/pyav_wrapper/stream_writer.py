@@ -1,18 +1,384 @@
+from __future__ import annotations
+
+import fractions
+import multiprocessing
 import os
+import pickle
 import queue
 import sys
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import av
+import numpy as np
 
 from pyav_wrapper.audio_frame import WrappedAudioFrame
 from pyav_wrapper.video_frame import WrappedVideoFrame
 
 if TYPE_CHECKING:
     from threading import Thread
+
+
+def _serialize_frame_common(frame: "av.frame.Frame") -> dict[str, Any]:
+    time_base = None
+    if frame.time_base is not None:
+        time_base = (frame.time_base.numerator, frame.time_base.denominator)
+
+    payload = {
+        "pts": frame.pts,
+        "dts": frame.dts,
+        "duration": frame.duration,
+        "time_base": time_base,
+    }
+    opaque = frame.opaque
+    if _is_picklable(opaque):
+        payload["opaque"] = opaque
+    return payload
+
+
+def _is_picklable(value: Any) -> bool:
+    try:
+        pickle.dumps(value)
+        return True
+    except Exception:
+        return False
+
+
+def _serialize_video_frame(frame: WrappedVideoFrame) -> dict[str, Any]:
+    planes: list[np.ndarray] = []
+    for plane in frame.frame.planes:
+        buffer = np.frombuffer(plane, dtype=np.uint8)
+        buffer = buffer.reshape(plane.height, plane.line_size)[:, : plane.width]
+        planes.append(buffer.copy())
+
+    payload = _serialize_frame_common(frame.frame)
+    payload.update(
+        {
+            "format": frame.frame.format.name,
+            "width": frame.frame.width,
+            "height": frame.frame.height,
+            "planes": planes,
+            "pict_type": frame.frame.pict_type,
+            "colorspace": frame.frame.colorspace,
+            "color_range": frame.frame.color_range,
+            "is_bad_frame": frame.is_bad_frame,
+        }
+    )
+    return payload
+
+
+def _serialize_audio_frame(frame: WrappedAudioFrame) -> dict[str, Any]:
+    data = frame.frame.to_ndarray()
+
+    payload = _serialize_frame_common(frame.frame)
+    payload.update(
+        {
+            "format": frame.frame.format.name,
+            "layout": frame.frame.layout.name,
+            "sample_rate": frame.frame.sample_rate,
+            "rate": frame.frame.rate,
+            "samples": frame.frame.samples,
+            "data": data,
+        }
+    )
+    return payload
+
+
+def _apply_common_frame_attrs(frame: "av.frame.Frame", payload: dict[str, Any]) -> None:
+    for key in ("pts", "dts", "duration", "side_data", "opaque"):
+        if key in payload:
+            try:
+                setattr(frame, key, payload[key])
+            except Exception:
+                pass
+    time_base = payload.get("time_base")
+    if time_base is not None:
+        try:
+            frame.time_base = fractions.Fraction(time_base[0], time_base[1])
+        except Exception:
+            pass
+
+
+def _apply_video_frame_attrs(frame: av.VideoFrame, payload: dict[str, Any]) -> None:
+    for key in ("pict_type", "colorspace", "color_range"):
+        if key in payload:
+            try:
+                setattr(frame, key, payload[key])
+            except Exception:
+                pass
+
+
+def _apply_audio_frame_attrs(frame: av.AudioFrame, payload: dict[str, Any]) -> None:
+    for key in ("sample_rate", "rate", "samples", "format", "layout"):
+        if key in payload:
+            try:
+                setattr(frame, key, payload[key])
+            except Exception:
+                pass
+
+
+def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
+    frame = av.VideoFrame(
+        payload["width"],
+        payload["height"],
+        payload["format"],
+    )
+    _apply_common_frame_attrs(frame, payload)
+    _apply_video_frame_attrs(frame, payload)
+    wrapped = WrappedVideoFrame(frame)
+    wrapped.set_planes(payload["planes"])
+    wrapped.is_bad_frame = payload.get("is_bad_frame", False)
+    return wrapped
+
+
+def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
+    frame = av.AudioFrame.from_ndarray(
+        payload["data"],
+        format=payload["format"],
+        layout=payload["layout"],
+    )
+    _apply_common_frame_attrs(frame, payload)
+    _apply_audio_frame_attrs(frame, payload)
+    return WrappedAudioFrame(frame)
+
+
+def _put_with_drop(
+    target_queue: multiprocessing.Queue,
+    item: dict[str, Any],
+    drop_count: int,
+) -> None:
+    try:
+        target_queue.put_nowait(item)
+        return
+    except queue.Full:
+        for _ in range(drop_count):
+            try:
+                target_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            target_queue.put_nowait(item)
+        except queue.Full:
+            return
+    except (ValueError, OSError):
+        return
+
+
+class _StreamWriterContainerProxy:
+    def __init__(self, on_close) -> None:
+        self._on_close = on_close
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._on_close()
+
+    def __bool__(self) -> bool:
+        return not self._closed
+
+
+def _stream_writer_worker(
+    url: str,
+    width: int,
+    height: int,
+    fps: int,
+    sample_rate: int,
+    audio_layout: str,
+    stats_enabled: bool,
+    stop_event: multiprocessing.Event,
+    video_queue: multiprocessing.Queue,
+    audio_queue: multiprocessing.Queue,
+    status_queue: multiprocessing.Queue | None,
+    control_queue: multiprocessing.Queue | None,
+) -> None:
+    container: av.Container | None = None
+    video_stream = None
+    audio_stream = None
+    last_video_frame: WrappedVideoFrame | None = None
+
+    wall_clock_origin: float = 0.0
+    pts_origin: float = 0.0
+
+    stats_video_frame_count: int = 0
+    stats_audio_frame_count: int = 0
+    stats_last_time: float = time.monotonic()
+
+    def _notify_status(status: str, payload: dict[str, Any] | None = None) -> None:
+        if status_queue is None:
+            return
+        message: dict[str, Any] = {"status": status}
+        if payload:
+            message.update(payload)
+        try:
+            status_queue.put_nowait(message)
+        except Exception:
+            pass
+
+    def _init_realtime_clock(frame: av.VideoFrame) -> None:
+        nonlocal wall_clock_origin, pts_origin
+        wall_clock_origin = time.monotonic()
+        if frame.pts is not None and frame.time_base is not None:
+            pts_origin = float(frame.pts * frame.time_base)
+        else:
+            pts_origin = 0.0
+
+    def _pace_frame(frame: av.VideoFrame) -> None:
+        if frame.pts is None or frame.time_base is None:
+            return
+
+        frame_time_sec = float(frame.pts * frame.time_base)
+        target_elapsed = frame_time_sec - pts_origin
+        actual_elapsed = time.monotonic() - wall_clock_origin
+        sleep_duration = target_elapsed - actual_elapsed
+
+        if sleep_duration > 0:
+            time.sleep(min(sleep_duration, 1.0))
+
+    def _wait_for_first_video_payload() -> dict[str, Any] | None:
+        while not stop_event.is_set():
+            try:
+                return video_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+        return None
+
+    def _open_container(target_width: int, target_height: int) -> tuple[av.Container, Any, Any]:
+        if url.startswith("srt://"):
+            next_container = av.open(url, mode="w", format="mpegts")
+        else:
+            next_container = av.open(url, mode="w")
+
+        next_video_stream = next_container.add_stream("libx264", rate=fps)
+        next_video_stream.width = target_width
+        next_video_stream.height = target_height
+        next_video_stream.pix_fmt = "yuv420p"
+        next_video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
+
+        next_audio_stream = next_container.add_stream("aac", rate=sample_rate)
+        next_audio_stream.layout = audio_layout
+
+        return next_container, next_video_stream, next_audio_stream
+
+    def _handle_control_commands() -> bool:
+        if control_queue is None:
+            return False
+        close_requested = False
+        while True:
+            try:
+                command = control_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(command, dict) and command.get("cmd") == "close_container":
+                close_requested = True
+        return close_requested
+
+    try:
+        first_payload = _wait_for_first_video_payload()
+        if first_payload is None:
+            return
+        first_frame = _deserialize_video_frame(first_payload)
+
+        try:
+            container, video_stream, audio_stream = _open_container(width, height)
+            _init_realtime_clock(first_frame.frame)
+            for packet in video_stream.encode(first_frame.frame):
+                container.mux(packet)
+            stats_video_frame_count += 1
+            _notify_status("started")
+        except Exception as e:
+            _notify_status("error", {"message": str(e)})
+            print(f"処理開始エラー: {str(e)}")
+            return
+
+        while not stop_event.is_set():
+            if _handle_control_commands():
+                if container is not None:
+                    try:
+                        container.close()
+                    except Exception:
+                        pass
+                container = None
+                break
+
+            if container is None:
+                break
+
+            has_data = False
+
+            try:
+                video_payload = video_queue.get(timeout=1 / 30)
+            except queue.Empty:
+                video_payload = None
+
+            if video_payload is not None:
+                wrapped_frame = _deserialize_video_frame(video_payload)
+                if wrapped_frame.is_bad_frame:
+                    if last_video_frame is not None:
+                        last_planes = last_video_frame.get_planes()
+                        wrapped_frame.set_planes(last_planes)
+                else:
+                    last_video_frame = wrapped_frame
+
+                has_data = True
+                _pace_frame(wrapped_frame.frame)
+                try:
+                    for packet in video_stream.encode(wrapped_frame.frame):
+                        container.mux(packet)
+                    stats_video_frame_count += 1
+                    _notify_status("write_success", {"kind": "video"})
+                except Exception as e:
+                    print(f"StreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
+
+            while True:
+                try:
+                    audio_payload = audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                wrapped_audio = _deserialize_audio_frame(audio_payload)
+                has_data = True
+                try:
+                    for packet in audio_stream.encode(wrapped_audio.frame):
+                        container.mux(packet)
+                    stats_audio_frame_count += 1
+                    _notify_status("write_success", {"kind": "audio"})
+                except Exception as e:
+                    print(f"StreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+
+            if not has_data:
+                time.sleep(0.001)
+
+            if stats_enabled:
+                now = time.monotonic()
+                stats_elapsed = now - stats_last_time
+                if stats_elapsed >= 5.0:
+                    video_fps = stats_video_frame_count / stats_elapsed
+                    audio_fps = stats_audio_frame_count / stats_elapsed
+                    print(f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}")
+                    stats_video_frame_count = 0
+                    stats_audio_frame_count = 0
+                    stats_last_time = now
+
+    except Exception as e:
+        print(f"StreamWriter書き込みエラー: {e}", file=sys.stderr)
+        traceback.print_exc()
+    finally:
+        if container is not None:
+            try:
+                if video_stream is not None:
+                    for packet in video_stream.encode():
+                        container.mux(packet)
+                if audio_stream is not None:
+                    for packet in audio_stream.encode():
+                        container.mux(packet)
+                container.close()
+            except Exception as e:
+                print(f"StreamWriterクローズ時にエラー: {e}", file=sys.stderr)
+                traceback.print_exc()
 
 
 class StreamWriter:
@@ -48,32 +414,31 @@ class StreamWriter:
         self.audio_layout = audio_layout
 
         # キューの初期化（FPSの1.7倍のキャパシティ）
-        # スレッドベースなのでqueue.Queue（pickle不要）を使用
-        # WrappedVideoFrame/WrappedAudioFrameを直接入れる
-        queue_size = int(fps * 1.7)
+        self._video_queue_maxlen = int(self.fps * 1.7)
+        self._audio_queue_maxlen = int(self.sample_rate * 1.7)
         self.video_queue: queue.Queue[WrappedVideoFrame] = queue.Queue(
-            maxsize=queue_size
+            maxsize=self._video_queue_maxlen
         )
-        queue_size_audio = int(sample_rate * 1.7)
         self.audio_queue: queue.Queue[WrappedAudioFrame] = queue.Queue(
-            maxsize=queue_size_audio
+            maxsize=self._audio_queue_maxlen
         )
 
-        # スレッド管理
+        # スレッド/プロセス管理
         self.is_running = False
-        self._thread: "Thread | None" = None
+        self._thread: "Thread | multiprocessing.Process | None" = None
         self._init_thread: "Thread | None" = None
+        self._monitor_thread: threading.Thread | None = None
 
-        # コンテナ（インスタンス変数として管理）
-        self.container: av.Container | None = None
+        # コンテナ/ストリーム
+        self._container: _StreamWriterContainerProxy | None = None
         self._video_stream = None
         self._audio_stream = None
 
-        # 最初のフレーム（start_processingで取得、_write_framesで使用）
+        # 最初のフレーム
         self._first_frame: WrappedVideoFrame | None = None
 
-        # 古いフレームの保持（フレームが取得できない場合の再利用用）
-        self._last_video_frame: "WrappedVideoFrame | None" = None
+        # 古いフレームの保持
+        self._last_video_frame: WrappedVideoFrame | None = None
 
         # リアルタイムペーシング用
         self._wall_clock_origin: float = 0.0
@@ -87,7 +452,7 @@ class StreamWriter:
         self._restart_wait_seconds: float = 5.0
         self._restart_frame_wait_timeout: float = 30.0
         self._restart_lock: threading.Lock = threading.Lock()
-        self._monitor_thread: threading.Thread | None = None
+        self._restart_in_progress = False
 
         # FPS統計
         self._stats_enabled = stats_enabled
@@ -95,8 +460,70 @@ class StreamWriter:
         self._stats_audio_frame_count: int = 0
         self._stats_last_time: float = time.monotonic()
 
+        # multiprocessing
+        self._mp_ctx = multiprocessing.get_context()
+        self._stop_event: multiprocessing.Event | None = None
+        self._video_mp_queue: multiprocessing.Queue | None = None
+        self._audio_mp_queue: multiprocessing.Queue | None = None
+        self._status_queue: multiprocessing.Queue | None = None
+        self._control_queue: multiprocessing.Queue | None = None
+        self._write_process: multiprocessing.Process | None = None
+        self._video_mp_queue_maxlen = self._video_queue_maxlen
+        self._audio_mp_queue_maxlen = min(self._audio_queue_maxlen, 32767)
+        self._video_drop_count = max(1, self._video_mp_queue_maxlen // 2)
+        self._audio_drop_count = max(1, self._audio_mp_queue_maxlen // 2)
+
+        self._setup_multiprocessing()
+
         # 自動起動
         self.start()
+
+    def _setup_multiprocessing(self) -> None:
+        if self._stop_event is None or self._stop_event.is_set():
+            self._stop_event = self._mp_ctx.Event()
+        if self._video_mp_queue is None:
+            self._video_mp_queue = self._mp_ctx.Queue(
+                maxsize=self._video_mp_queue_maxlen
+            )
+        if self._audio_mp_queue is None:
+            self._audio_mp_queue = self._mp_ctx.Queue(
+                maxsize=self._audio_mp_queue_maxlen
+            )
+        if self._status_queue is None:
+            self._status_queue = self._mp_ctx.Queue(maxsize=1000)
+        if self._control_queue is None:
+            self._control_queue = self._mp_ctx.Queue(maxsize=10)
+
+    def _drain_status_queue(self) -> None:
+        if self._status_queue is None:
+            return
+        while True:
+            try:
+                payload = self._status_queue.get_nowait()
+            except queue.Empty:
+                break
+            status = payload.get("status")
+            if status == "write_success":
+                self._last_successful_write_time = time.time()
+                kind = payload.get("kind")
+                if kind == "video":
+                    self._stats_video_frame_count += 1
+                elif kind == "audio":
+                    self._stats_audio_frame_count += 1
+            elif status == "started":
+                self._last_successful_write_time = time.time()
+            elif status == "error":
+                message = payload.get("message")
+                if message:
+                    print(f"処理開始エラー: {message}")
+
+    def _request_container_close(self) -> None:
+        if self._control_queue is None:
+            return
+        try:
+            self._control_queue.put_nowait({"cmd": "close_container"})
+        except Exception:
+            pass
 
     def enqueue_video_frame(self, frame: WrappedVideoFrame) -> None:
         """映像フレームをキューに追加（ノンブロッキング）
@@ -106,21 +533,34 @@ class StreamWriter:
         """
         try:
             if self.video_queue.full():
-                # キューが満杯の場合は古いフレームを捨てる（50%程度）
                 try:
                     drop_count = max(1, self.video_queue.qsize() // 2)
                 except NotImplementedError:
-                    drop_count = 1  # macOSではqsize()が使えない
+                    drop_count = 1
                 for _ in range(drop_count):
                     try:
                         self.video_queue.get_nowait()
                     except queue.Empty:
                         break
 
-            # WrappedVideoFrameを直接キューに入れる
             self.video_queue.put_nowait(frame)
         except Exception as e:
             print(f"映像フレームをキューに追加中にエラー: {repr(e)}")
+
+        if self._video_mp_queue is None:
+            return
+        try:
+            payload = _serialize_video_frame(frame)
+            _put_with_drop(
+                self._video_mp_queue,
+                payload,
+                self._video_drop_count,
+            )
+        except Exception as e:
+            print(f"映像フレームをキューに追加中にエラー: {repr(e)}")
+
+        if self._wall_clock_origin == 0.0:
+            self._init_realtime_clock(frame.frame)
 
     def enqueue_video_frames(self, frames: list[WrappedVideoFrame]) -> None:
         """複数の映像フレームをキューに追加
@@ -139,19 +579,29 @@ class StreamWriter:
         """
         try:
             if self.audio_queue.full():
-                # キューが満杯の場合は古いフレームを捨てる（50%程度）
                 try:
                     drop_count = max(1, self.audio_queue.qsize() // 2)
                 except NotImplementedError:
-                    drop_count = 1  # macOSではqsize()が使えない
+                    drop_count = 1
                 for _ in range(drop_count):
                     try:
                         self.audio_queue.get_nowait()
                     except queue.Empty:
                         break
 
-            # WrappedAudioFrameを直接キューに入れる
             self.audio_queue.put_nowait(frame)
+        except Exception as e:
+            print(f"音声フレームをキューに追加中にエラー: {repr(e)}")
+
+        if self._audio_mp_queue is None:
+            return
+        try:
+            payload = _serialize_audio_frame(frame)
+            _put_with_drop(
+                self._audio_mp_queue,
+                payload,
+                self._audio_drop_count,
+            )
         except Exception as e:
             print(f"音声フレームをキューに追加中にエラー: {repr(e)}")
 
@@ -170,44 +620,153 @@ class StreamWriter:
         self._init_thread.start()
 
     def start_processing(self) -> str:
-        """コンテナを初期化し、書き込みスレッドを開始"""
+        """コンテナを初期化し、書き込みプロセスを開始"""
         try:
-            # 最初のフレームから情報を取得するので保存
-            first_frame = None
-            while first_frame is None:
-                try:
-                    first_frame = self.video_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-
-            self._first_frame = first_frame
-
-            # PyAVコンテナとストリームを初期化
-            # ファイル出力の場合はformatを明示せず拡張子から自動判別
-            # SRT出力の場合はmpegtsを使用
-            if self.url.startswith("srt://"):
-                self.container = av.open(self.url, mode="w", format="mpegts")
-            else:
-                self.container = av.open(self.url, mode="w")
-
-            self._video_stream = self.container.add_stream("libx264", rate=self.fps)
-            self._video_stream.width = self.width
-            self._video_stream.height = self.height
-            self._video_stream.pix_fmt = "yuv420p"
-            self._video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
-
-            self._audio_stream = self.container.add_stream("aac", rate=self.sample_rate)
-            self._audio_stream.layout = self.audio_layout
-
+            if self.is_running:
+                return "ストリーム処理は既に開始しています"
+            self._setup_multiprocessing()
             self.is_running = True
-            self._last_successful_write_time = time.time()
-            self._thread = threading.Thread(target=self._write_frames, daemon=True)
-            self._thread.start()
-            self._monitor_thread = threading.Thread(target=self._monitor_write_updates, daemon=True)
+            self._start_write_process()
+            status = self._wait_for_start_status()
+            if status.startswith("処理開始エラー"):
+                self.is_running = False
+                return status
+            self._clear_local_queues()
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_write_updates, daemon=True
+            )
             self._monitor_thread.start()
-            return "ストリーム処理を開始しました"
+            return status
         except Exception as e:
+            self.is_running = False
             return f"処理開始エラー: {str(e)}"
+
+    def _wait_for_start_status(self) -> str:
+        if self._status_queue is None:
+            return "ストリーム処理を開始しました"
+        while True:
+            if not self.is_running:
+                return "処理開始エラー: 停止しました"
+            try:
+                status = self._status_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if status.get("status") == "started":
+                self._last_successful_write_time = time.time()
+                return "ストリーム処理を開始しました"
+            if status.get("status") == "error":
+                message = status.get("message", "")
+                return f"処理開始エラー: {message}"
+
+    def _start_write_process(self, width: int | None = None, height: int | None = None) -> None:
+        if not self.is_running:
+            return
+        if width is None:
+            width = self.width
+        if height is None:
+            height = self.height
+        self._stop_event = self._mp_ctx.Event()
+        if (
+            self._video_mp_queue is None
+            or self._audio_mp_queue is None
+            or self._status_queue is None
+            or self._control_queue is None
+        ):
+            self._setup_multiprocessing()
+        if self._write_process and self._write_process.is_alive():
+            return
+        if self._status_queue is not None:
+            try:
+                while True:
+                    self._status_queue.get_nowait()
+            except queue.Empty:
+                pass
+        if self._control_queue is not None:
+            try:
+                while True:
+                    self._control_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+        self._write_process = self._mp_ctx.Process(
+            target=_stream_writer_worker,
+            args=(
+                self.url,
+                width,
+                height,
+                self.fps,
+                self.sample_rate,
+                self.audio_layout,
+                self._stats_enabled,
+                self._stop_event,
+                self._video_mp_queue,
+                self._audio_mp_queue,
+                self._status_queue,
+                self._control_queue,
+            ),
+            daemon=True,
+        )
+        self._write_process.start()
+        self._thread = self._write_process
+        self.container = _StreamWriterContainerProxy(self._request_container_close)
+
+    def _stop_write_process(self) -> None:
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        if self._write_process and self._write_process.is_alive():
+            self._write_process.join(timeout=5.0)
+        if self._write_process and self._write_process.is_alive():
+            self._write_process.terminate()
+            self._write_process.join(timeout=5.0)
+        self._write_process = None
+        if self._thread is not None and isinstance(self._thread, multiprocessing.Process):
+            self._thread = None
+
+    def _close_mp_queues(self) -> None:
+        video_mp_queue = getattr(self, "_video_mp_queue", None)
+        if video_mp_queue is not None:
+            try:
+                video_mp_queue.cancel_join_thread()
+                video_mp_queue.close()
+            except Exception:
+                pass
+        audio_mp_queue = getattr(self, "_audio_mp_queue", None)
+        if audio_mp_queue is not None:
+            try:
+                audio_mp_queue.cancel_join_thread()
+                audio_mp_queue.close()
+            except Exception:
+                pass
+        status_queue = getattr(self, "_status_queue", None)
+        if status_queue is not None:
+            try:
+                status_queue.cancel_join_thread()
+                status_queue.close()
+            except Exception:
+                pass
+        control_queue = getattr(self, "_control_queue", None)
+        if control_queue is not None:
+            try:
+                control_queue.cancel_join_thread()
+                control_queue.close()
+            except Exception:
+                pass
+        self._video_mp_queue = None
+        self._audio_mp_queue = None
+        self._status_queue = None
+        self._control_queue = None
+
+    @property
+    def container(self) -> _StreamWriterContainerProxy | None:
+        return self._container
+
+    @container.setter
+    def container(self, value: _StreamWriterContainerProxy | None) -> None:
+        self._container = value
+        write_process = getattr(self, "_write_process", None)
+        if value is None and write_process is not None:
+            self._stop_write_process()
 
     def _init_realtime_clock(self, frame: av.VideoFrame) -> None:
         """リアルタイムペーシングの基準時刻を設定する
@@ -241,6 +800,9 @@ class StreamWriter:
     def _write_frames(self) -> None:
         """エンコード・送信ループ (StreamListenerの_read_framesに対応)"""
         try:
+            if self._first_frame is None:
+                return
+
             # リアルタイムペーシングの基準時刻を設定
             self._init_realtime_clock(self._first_frame.frame)
 
@@ -268,7 +830,10 @@ class StreamWriter:
                         self._last_successful_write_time = time.time()
                         self._stats_video_frame_count += 1
                     except Exception as e:
-                        print(f"StreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
+                        print(
+                            f"StreamWriter映像muxエラー（スキップ）: {e}",
+                            file=sys.stderr,
+                        )
 
                 # 音声フレームの処理（キューにある全フレームを処理）
                 while True:
@@ -283,7 +848,10 @@ class StreamWriter:
                         self._last_successful_write_time = time.time()
                         self._stats_audio_frame_count += 1
                     except Exception as e:
-                        print(f"StreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                        print(
+                            f"StreamWriter音声muxエラー（スキップ）: {e}",
+                            file=sys.stderr,
+                        )
 
                 if not has_data:
                     time.sleep(0.001)
@@ -304,41 +872,31 @@ class StreamWriter:
                     print(f"StreamWriterクローズ時にエラー: {e}", file=sys.stderr)
                     traceback.print_exc()
 
-    def stop(self) -> None:
-        """ストリーム処理を停止"""
-        self.is_running = False
-        init_thread = getattr(self, "_init_thread", None)
-        if init_thread and init_thread.is_alive():
-            init_thread.join(timeout=5.0)
-        self._init_thread = None
-        thread = getattr(self, "_thread", None)
-        if thread and thread.is_alive():
-            thread.join(timeout=5.0)
-        self._thread = None
-        monitor_thread = getattr(self, "_monitor_thread", None)
-        if monitor_thread and monitor_thread.is_alive():
-            monitor_thread.join(timeout=10.0)
-        self._monitor_thread = None
-
     def _monitor_write_updates(self) -> None:
         """書き込み更新を監視し、閾値超過時に再接続を試みる"""
         while self.is_running:
-            time.sleep(1.0)
+            self._drain_status_queue()
+
             if not self.is_running:
                 break
 
-            elapsed = time.time() - self._last_successful_write_time
-            if elapsed > self._restart_threshold:
-                print(f"書き込み更新が{elapsed:.1f}秒間停止。再接続を試みます (閾値: {self._restart_threshold:.1f}秒)")
-                with self._restart_lock:
-                    if not self.is_running:
-                        break
-                    self._restart_threshold += self._restart_threshold_increment
-                    if self._restart_threshold >= self._restart_threshold_max:
-                        print(f"再接続閾値が上限({self._restart_threshold_max}秒)に達しました。プロセスを終了します。")
-                        os._exit(1)
-                    self._restart_connection()
-                    # _restart_connectionがFalseを返した場合もループを継続し再試行する
+            write_process = getattr(self, "_write_process", None)
+            if write_process is not None:
+                if self.container is None:
+                    self._stop_write_process()
+                    time.sleep(0.1)
+                    continue
+                if write_process and not write_process.is_alive():
+                    self._force_restart()
+
+            if self._last_successful_write_time > 0.0:
+                elapsed = time.time() - self._last_successful_write_time
+                if elapsed > self._restart_threshold:
+                    print(
+                        f"書き込み更新が{elapsed:.1f}秒間停止。再接続を試みます "
+                        f"(閾値: {self._restart_threshold:.1f}秒)"
+                    )
+                    self._force_restart()
 
             # FPS統計出力
             if self._stats_enabled:
@@ -347,10 +905,32 @@ class StreamWriter:
                 if stats_elapsed >= 5.0:
                     video_fps = self._stats_video_frame_count / stats_elapsed
                     audio_fps = self._stats_audio_frame_count / stats_elapsed
-                    print(f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}")
+                    print(
+                        f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}"
+                    )
                     self._stats_video_frame_count = 0
                     self._stats_audio_frame_count = 0
                     self._stats_last_time = now
+
+            time.sleep(1.0)
+
+    def _force_restart(self) -> None:
+        with self._restart_lock:
+            if not self.is_running or self._restart_in_progress:
+                return
+            self._restart_in_progress = True
+            self._restart_threshold += self._restart_threshold_increment
+            if self._restart_threshold >= self._restart_threshold_max:
+                print(
+                    f"再接続閾値が上限({self._restart_threshold_max}秒)に達しました。"
+                    "プロセスを終了します。"
+                )
+                os._exit(1)
+        try:
+            self._restart_connection()
+        finally:
+            with self._restart_lock:
+                self._restart_in_progress = False
 
     def _interruptible_sleep(self, seconds: float) -> None:
         """is_runningチェック付きスリープ。0.5秒間隔で分割。"""
@@ -360,7 +940,30 @@ class StreamWriter:
             time.sleep(sleep_time)
             remaining -= sleep_time
 
-    def _wait_for_first_frame(self, timeout: float) -> "WrappedVideoFrame | None":
+    def _clear_mp_queue(self, target: multiprocessing.Queue | None) -> None:
+        if target is None:
+            return
+        while True:
+            try:
+                target.get_nowait()
+            except queue.Empty:
+                break
+            except (ValueError, OSError):
+                break
+
+    def _clear_local_queues(self) -> None:
+        while True:
+            try:
+                self.video_queue.get_nowait()
+            except queue.Empty:
+                break
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _wait_for_first_frame(self, timeout: float) -> WrappedVideoFrame | None:
         """タイムアウト付きで最初のフレームをキューから取得。"""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -381,7 +984,7 @@ class StreamWriter:
         if not self.is_running:
             return False
 
-        # 古いcontainerをNoneに設定後close（_write_framesがbreakする）
+        # 古いcontainerをNoneに設定後close
         old_container = self.container
         self.container = None
         if old_container:
@@ -390,9 +993,12 @@ class StreamWriter:
             except Exception:
                 pass
 
-        # 古い書込スレッドを待機
-        if self._thread and self._thread.is_alive():
+        # 古い書込プロセス/スレッドを待機
+        if self._write_process is not None:
+            self._stop_write_process()
+        elif self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
+            self._thread = None
 
         if not self.is_running:
             return False
@@ -403,47 +1009,56 @@ class StreamWriter:
         if not self.is_running:
             return False
 
+        self._clear_mp_queue(self._video_mp_queue)
+        self._clear_mp_queue(self._audio_mp_queue)
+        self._clear_local_queues()
+
         # キューから次のフレームを取得して_first_frameに設定（タイムアウト付き）
         first_frame = self._wait_for_first_frame(self._restart_frame_wait_timeout)
         if first_frame is None:
             return False
 
         self._first_frame = first_frame
+        self._init_realtime_clock(first_frame.frame)
 
         # フレームから実際の解像度を取得
         actual_width = first_frame.frame.width
         actual_height = first_frame.frame.height
 
-        # 新コンテナ・ストリームを作成
-        try:
-            if self.url.startswith("srt://"):
-                self.container = av.open(self.url, mode="w", format="mpegts")
-            else:
-                self.container = av.open(self.url, mode="w")
+        self._last_successful_write_time = time.time()
+        self._start_write_process(width=actual_width, height=actual_height)
+        print("StreamWriter再接続に成功しました")
+        return True
 
-            self._video_stream = self.container.add_stream("libx264", rate=self.fps)
-            self._video_stream.width = actual_width
-            self._video_stream.height = actual_height
-            self._video_stream.pix_fmt = "yuv420p"
-            self._video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
+    def stop(self) -> None:
+        """ストリーム処理を停止"""
+        self.is_running = False
+        init_thread = getattr(self, "_init_thread", None)
+        if init_thread and init_thread.is_alive():
+            init_thread.join(timeout=5.0)
+        self._init_thread = None
 
-            self._audio_stream = self.container.add_stream("aac", rate=self.sample_rate)
-            self._audio_stream.layout = self.audio_layout
+        monitor_thread = getattr(self, "_monitor_thread", None)
+        if monitor_thread and monitor_thread.is_alive():
+            monitor_thread.join(timeout=10.0)
+        self._monitor_thread = None
 
-            self._last_successful_write_time = time.time()
-            self._thread = threading.Thread(target=self._write_frames, daemon=True)
-            self._thread.start()
-            print("StreamWriter再接続に成功しました")
-            return True
-        except Exception as e:
-            print(f"StreamWriter再接続エラー: {str(e)}")
-            return False
+        write_process = getattr(self, "_write_process", None)
+        if write_process is not None:
+            self._stop_write_process()
+        else:
+            thread = getattr(self, "_thread", None)
+            if thread and thread.is_alive():
+                thread.join(timeout=5.0)
+            self._thread = None
+
+        self._close_mp_queues()
 
     def __del__(self) -> None:
         """リソース解放"""
         self.stop()
 
-    def _process_video_frame(self) -> "WrappedVideoFrame | None":
+    def _process_video_frame(self) -> WrappedVideoFrame | None:
         """映像フレームを取得
 
         is_bad_frameがTrueの場合は、最後に送信したフレームの生データで差し替える。
@@ -467,7 +1082,7 @@ class StreamWriter:
 
         return wrapped_frame
 
-    def _get_audio_frame(self) -> "WrappedAudioFrame | None":
+    def _get_audio_frame(self) -> WrappedAudioFrame | None:
         """音声フレームをキューから取得
 
         Returns:

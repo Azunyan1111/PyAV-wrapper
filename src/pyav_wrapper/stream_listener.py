@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import fractions
 import multiprocessing
@@ -382,7 +384,7 @@ class StreamListener:
             had_data |= self._drain_audio_queue()
 
             if not had_data:
-                time.sleep(1.0)
+                time.sleep(0.1)
 
             if not self.is_running:
                 break

@@ -66,9 +66,10 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
     def _close_stderr_file(self):
         """stderrログファイルを閉じる"""
-        if self._stderr_file is not None:
+        stderr_file = getattr(self, "_stderr_file", None)
+        if stderr_file is not None:
             try:
-                self._stderr_file.close()
+                stderr_file.close()
             except Exception:
                 pass
             self._stderr_file = None
