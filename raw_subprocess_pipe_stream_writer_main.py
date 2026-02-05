@@ -1,0 +1,82 @@
+import os
+import time
+from pyav_wrapper import RawSubprocessPipeStreamListener, RawSubprocessPipeStreamWriter
+
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.v2")
+
+
+def _load_env_file(path: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip()
+    return env
+
+
+try:
+    _env = _load_env_file(ENV_PATH)
+except FileNotFoundError as e:
+    raise SystemExit(f"{ENV_PATH} が見つかりません") from e
+
+_required_keys = ("WHEP_CLIENT", "WHIP_CLIENT", "WHEP_URL", "WHIP_URL")
+_missing_keys = [key for key in _required_keys if not _env.get(key)]
+if _missing_keys:
+    raise SystemExit(f".env.v2 に必須キーがありません: {', '.join(_missing_keys)}")
+
+WHEP_CLIENT = _env["WHEP_CLIENT"]
+WHIP_CLIENT = _env["WHIP_CLIENT"]
+WHEP_URL = _env["WHEP_URL"]
+WHIP_URL = _env["WHIP_URL"]
+
+def main() -> None:
+    # 1. WHEP受信開始
+    print(f"Starting WHEP listener for {WHEP_URL}...")
+    listener = RawSubprocessPipeStreamListener(command=[WHEP_CLIENT, WHEP_URL], width=1600, height=900)
+    print("WHEP listener started.")
+
+    # 2. WHIP送信開始
+    print(f"Starting WHIP writer to {WHIP_URL}...")
+    writer = RawSubprocessPipeStreamWriter(
+        command=[WHIP_CLIENT, WHIP_URL],
+        width=1600,
+        height=900,
+        fps=30,
+    )
+    print("WHIP writer started.")
+
+    # 4. 継続的に中継（300秒間）
+    t = time.time()
+    while True:
+        # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
+        video_frames = listener.pop_all_video_queue()
+        for vf in video_frames:
+            writer.enqueue_video_frame(vf)
+        audio_frames = listener.pop_all_audio_queue()
+        for af in audio_frames:
+            writer.enqueue_audio_frame(af)
+        if len(video_frames) > 0:
+            # 両方の一番最初のフレームのタイムスタンプを表示
+            first_frame = video_frames[0]
+            print(f"First frame: {first_frame.frame.pts}")
+            if len(audio_frames) > 0:
+                first_audio_frame = audio_frames[0]
+                print(f"First audio frame: {first_audio_frame.frame.pts}")
+
+            print(f"Sent frames in {time.time() - t:.4f} seconds.")
+            t = time.time()
+            print(f"Send Video Frame size: {len(video_frames)}, Audio Frame size: {len(audio_frames)}")
+        time.sleep(1)
+
+    # 6. 終了
+    writer.stop()
+    listener.stop()
+
+
+if __name__ == "__main__":
+    main()

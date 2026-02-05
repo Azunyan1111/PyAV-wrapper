@@ -3,8 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.env.v2
 
-a.serena/
 deps/
 
 *.mp4

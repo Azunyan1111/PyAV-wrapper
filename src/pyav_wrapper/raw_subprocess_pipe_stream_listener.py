@@ -1,10 +1,109 @@
 import subprocess
-import threading
 import time
 
 import av
 
-from pyav_wrapper.stream_listener import StreamListener
+from pyav_wrapper.stream_listener import (
+    StreamListener,
+    _put_with_drop,
+    _serialize_audio_frame,
+    _serialize_video_frame,
+)
+
+
+def _raw_subprocess_pipe_decode_worker(
+    command: list[str],
+    width: int,
+    height: int,
+    stop_event,
+    video_queue,
+    audio_queue,
+    video_drop_count: int,
+    audio_drop_count: int,
+    start_timeout_seconds: float,
+    start_retry_interval_seconds: float,
+) -> None:
+    process: subprocess.Popen | None = None
+    container: av.container.Container | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        deadline = time.monotonic() + start_timeout_seconds
+        last_error: str | None = None
+        while time.monotonic() < deadline and not stop_event.is_set():
+            if process.poll() is not None:
+                last_error = f"サブプロセスが終了しました (returncode={process.returncode})"
+                break
+            try:
+                container = av.open(process.stdout, format="matroska", mode="r")
+                break
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(start_retry_interval_seconds)
+
+        if container is None:
+            if last_error is not None:
+                print(f"コンテナのopenに失敗しました: {last_error}")
+            return
+
+        video_stream = (
+            container.streams.video[0]
+            if container.streams.video
+            else None
+        )
+        audio_stream = (
+            container.streams.audio[0]
+            if container.streams.audio
+            else None
+        )
+
+        streams_to_decode = [
+            s for s in [video_stream, audio_stream] if s is not None
+        ]
+
+        for frame in container.decode(*streams_to_decode):
+            if stop_event.is_set():
+                break
+
+            if isinstance(frame, av.VideoFrame):
+                if width is not None and height is not None:
+                    if frame.width != width or frame.height != height:
+                        frame = frame.reformat(width=width, height=height)
+                payload = _serialize_video_frame(frame)
+                _put_with_drop(video_queue, payload, video_drop_count)
+
+            elif isinstance(frame, av.AudioFrame):
+                payload = _serialize_audio_frame(frame)
+                _put_with_drop(audio_queue, payload, audio_drop_count)
+
+    except Exception as e:
+        print(f"フレーム読み込みエラー: {str(e)}")
+    finally:
+        if container:
+            try:
+                container.close()
+            except Exception:
+                pass
+        if process is not None:
+            try:
+                if process.stdout:
+                    process.stdout.close()
+                if process.stderr:
+                    process.stderr.close()
+            except Exception:
+                pass
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            except Exception:
+                pass
 
 
 class RawSubprocessPipeStreamListener(StreamListener):
@@ -42,124 +141,34 @@ class RawSubprocessPipeStreamListener(StreamListener):
             audio_layout=audio_layout,
         )
 
-    def _open_container_with_retry(self) -> av.container.Container | None:
-        """MKVコンテナをリトライ付きでopenする"""
-        deadline = time.monotonic() + self._start_timeout_seconds
-        last_error: str | None = None
-        while time.monotonic() < deadline:
-            if self._process is None:
-                last_error = "サブプロセスが起動していません"
-                break
-            if self._process.poll() is not None:
-                last_error = f"サブプロセスが終了しました (returncode={self._process.returncode})"
-                break
-            try:
-                container = av.open(self._process.stdout, format="matroska", mode="r")
-                self._start_error = None
-                return container
-            except Exception as e:
-                last_error = str(e)
-                time.sleep(self._start_retry_interval_seconds)
-        self._start_error = last_error
-        return None
-
-    def start_processing(self) -> str:
-        """サブプロセスを起動し、stdoutパイプからストリーム処理を開始"""
-        try:
-            self._process = subprocess.Popen(
+    def _start_read_process(self) -> None:
+        if self._stop_event is None:
+            self._stop_event = self._mp_ctx.Event()
+        self._read_thread = self._mp_ctx.Process(
+            target=_raw_subprocess_pipe_decode_worker,
+            args=(
                 self._command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            container = self._open_container_with_retry()
-            if container is None:
-                raise RuntimeError(self._start_error or "コンテナのopenに失敗しました")
-            self.container = container
-            self.is_running = True
-            self._last_successful_read_time = time.time()
-            self._read_thread = threading.Thread(target=self._read_frames, daemon=True)
-            self._read_thread.start()
-            self._monitor_thread = threading.Thread(target=self._monitor_frame_updates, daemon=True)
-            self._monitor_thread.start()
-            return "サブプロセスパイプからのストリーム処理を開始しました"
-        except Exception as e:
-            if self._process is not None:
-                self._process.kill()
-                self._process.wait()
-                self._process = None
-            return f"処理開始エラー: {str(e)}"
+                self.width,
+                self.height,
+                self._stop_event,
+                self._video_mp_queue,
+                self._audio_mp_queue,
+                self._video_drop_count,
+                self._audio_drop_count,
+                self._start_timeout_seconds,
+                self._start_retry_interval_seconds,
+            ),
+            daemon=True,
+        )
+        self._read_thread.start()
 
     def stop(self) -> None:
         """ストリーム処理とサブプロセスを停止"""
         super().stop()
-        if self._process is not None:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            self._process = None
+        self._process = None
 
     def _restart_connection(self) -> None:
         """サブプロセスパイプ接続を再確立する"""
-        if not self.is_running:
-            return
-
-        # 古いcontainerをclose
-        if self.container:
-            try:
-                self.container.close()
-            except Exception:
-                pass
-            self.container = None
-
-        # 古い読み込みスレッドを待機
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=5.0)
-
-        # 古いサブプロセスを停止
-        if self._process is not None:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            except Exception:
-                pass
-            self._process = None
-
-        if not self.is_running:
-            return
-
-        # 再接続待機
-        time.sleep(self._restart_wait_seconds)
-
-        if not self.is_running:
-            return
-
-        # 新しいサブプロセスを起動
-        try:
-            self._process = subprocess.Popen(
-                self._command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            container = self._open_container_with_retry()
-            if container is None:
-                raise RuntimeError(self._start_error or "コンテナのopenに失敗しました")
-            self.container = container
-            self._last_successful_read_time = time.time()
-            self._read_thread = threading.Thread(target=self._read_frames, daemon=True)
-            self._read_thread.start()
-            print("サブプロセスパイプの再接続に成功しました")
-        except Exception as e:
-            print(f"サブプロセスパイプの再接続エラー: {str(e)}")
-            if self._process is not None:
-                try:
-                    self._process.kill()
-                    self._process.wait()
-                except Exception:
-                    pass
-                self._process = None
+        self._start_error = None
+        self._process = None
+        super()._restart_connection()

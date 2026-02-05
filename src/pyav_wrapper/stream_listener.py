@@ -1,12 +1,173 @@
 import collections
+import fractions
+import multiprocessing
 import os
+import pickle
+import queue
 import threading
 import time
+from typing import Any
 
 import av
+import numpy as np
 
 from pyav_wrapper.audio_frame import WrappedAudioFrame
 from pyav_wrapper.video_frame import WrappedVideoFrame
+
+
+def _serialize_frame_common(frame: "av.frame.Frame") -> dict[str, Any]:
+    time_base = None
+    if frame.time_base is not None:
+        time_base = (frame.time_base.numerator, frame.time_base.denominator)
+
+    payload = {
+        "pts": frame.pts,
+        "dts": frame.dts,
+        "duration": frame.duration,
+        "time_base": time_base,
+    }
+    opaque = frame.opaque
+    if _is_picklable(opaque):
+        payload["opaque"] = opaque
+    return payload
+
+
+def _is_picklable(value: Any) -> bool:
+    try:
+        pickle.dumps(value)
+        return True
+    except Exception:
+        return False
+
+
+def _serialize_video_frame(frame: av.VideoFrame) -> dict[str, Any]:
+    planes: list[np.ndarray] = []
+    for plane in frame.planes:
+        buffer = np.frombuffer(plane, dtype=np.uint8)
+        buffer = buffer.reshape(plane.height, plane.line_size)[:, : plane.width]
+        planes.append(buffer.copy())
+
+    payload = _serialize_frame_common(frame)
+    payload.update(
+        {
+            "format": frame.format.name,
+            "width": frame.width,
+            "height": frame.height,
+            "planes": planes,
+            "pict_type": frame.pict_type,
+            "colorspace": frame.colorspace,
+            "color_range": frame.color_range,
+        }
+    )
+    return payload
+
+
+def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
+    data = frame.to_ndarray()
+
+    payload = _serialize_frame_common(frame)
+    payload.update(
+        {
+            "format": frame.format.name,
+            "layout": frame.layout.name,
+            "sample_rate": frame.sample_rate,
+            "rate": frame.rate,
+            "samples": frame.samples,
+            "data": data,
+        }
+    )
+    return payload
+
+
+def _put_with_drop(
+    target_queue: multiprocessing.Queue,
+    item: dict[str, Any],
+    drop_count: int,
+) -> None:
+    try:
+        target_queue.put_nowait(item)
+        return
+    except queue.Full:
+        for _ in range(drop_count):
+            try:
+                target_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            target_queue.put_nowait(item)
+        except queue.Full:
+            return
+    except (ValueError, OSError):
+        return
+
+
+def _stream_listener_decode_worker(
+    url: str,
+    width: int,
+    height: int,
+    stop_event: multiprocessing.Event,
+    video_queue: multiprocessing.Queue,
+    audio_queue: multiprocessing.Queue,
+    video_drop_count: int,
+    audio_drop_count: int,
+) -> None:
+    container: av.Container | None = None
+    try:
+        container = av.open(url)
+
+        video_stream = (
+            container.streams.video[0]
+            if container.streams.video
+            else None
+        )
+        audio_stream = (
+            container.streams.audio[0]
+            if container.streams.audio
+            else None
+        )
+
+        streams_to_decode = [
+            s for s in [video_stream, audio_stream] if s is not None
+        ]
+
+        for frame in container.decode(*streams_to_decode):
+            if stop_event.is_set():
+                break
+
+            if isinstance(frame, av.VideoFrame):
+                if width is not None and height is not None:
+                    if frame.width != width or frame.height != height:
+                        frame = frame.reformat(width=width, height=height)
+                payload = _serialize_video_frame(frame)
+                _put_with_drop(video_queue, payload, video_drop_count)
+
+            elif isinstance(frame, av.AudioFrame):
+                payload = _serialize_audio_frame(frame)
+                _put_with_drop(audio_queue, payload, audio_drop_count)
+
+    except Exception as e:
+        print(f"フレーム読み込みエラー: {str(e)}")
+    finally:
+        if container:
+            try:
+                container.close()
+            except Exception:
+                pass
+
+
+class _StreamListenerContainerProxy:
+    def __init__(self, on_close) -> None:
+        self._on_close = on_close
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._on_close()
+
+    def __bool__(self) -> bool:
+        return not self._closed
 
 
 class StreamListener:
@@ -39,8 +200,8 @@ class StreamListener:
         self.sample_rate = sample_rate
         self.audio_layout = audio_layout
         self.is_running = False
-        self.container: av.Container | None = None
-        self._read_thread: threading.Thread | None = None
+        self.container: _StreamListenerContainerProxy | None = None
+        self._read_thread: multiprocessing.Process | None = None
 
         # Video
         self.batch_size = fps
@@ -59,6 +220,16 @@ class StreamListener:
         self.audio_queue: collections.deque[WrappedAudioFrame] = collections.deque()
         self.audio_queue_lock = threading.Lock()
 
+        # multiprocessing
+        self._mp_ctx = multiprocessing.get_context()
+        self._stop_event: multiprocessing.Event | None = None
+        self._video_mp_queue: multiprocessing.Queue | None = None
+        self._audio_mp_queue: multiprocessing.Queue | None = None
+        self._video_mp_queue_maxlen = int(self.batch_size * 1.7)
+        self._audio_mp_queue_maxlen = int(self.batch_size * 1.7)
+        self._video_drop_count = max(1, self._video_mp_queue_maxlen // 10)
+        self._audio_drop_count = max(1, self._audio_mp_queue_maxlen // 10)
+
         # Reconnection
         self._last_successful_read_time: float = time.time()
         self._restart_threshold: float = 10.0
@@ -66,6 +237,8 @@ class StreamListener:
         self._restart_threshold_max: float = 20.0
         self._restart_wait_seconds: float = 5.0
         self._restart_lock: threading.Lock = threading.Lock()
+        self._restart_requested = False
+        self._restart_in_progress = False
         self._monitor_thread: threading.Thread | None = None
 
         self.start_processing()
@@ -73,62 +246,192 @@ class StreamListener:
     def start_processing(self) -> str:
         """ストリーム処理を開始"""
         try:
-            self.container = av.open(self.url)
+            self._setup_multiprocessing()
+            self.container = _StreamListenerContainerProxy(self._request_restart)
             self.is_running = True
             self._last_successful_read_time = time.time()
-            self._read_thread = threading.Thread(target=self._read_frames, daemon=True)
-            self._read_thread.start()
-            self._monitor_thread = threading.Thread(target=self._monitor_frame_updates, daemon=True)
+            self._start_read_process()
+            self._monitor_thread = threading.Thread(
+                target=self._drain_and_monitor, daemon=True
+            )
             self._monitor_thread.start()
             return "ストリーム処理を開始しました"
         except Exception as e:
             return f"処理開始エラー: {str(e)}"
 
-    def _read_frames(self) -> None:
-        """フレーム読み込みスレッド（Video + Audio同時デコード）"""
-        try:
-            container = self.container
-            if container is None:
-                return
+    def _setup_multiprocessing(self) -> None:
+        self._stop_event = self._mp_ctx.Event()
+        self._video_mp_queue = self._mp_ctx.Queue(maxsize=self._video_mp_queue_maxlen)
+        self._audio_mp_queue = self._mp_ctx.Queue(maxsize=self._audio_mp_queue_maxlen)
 
-            video_stream = (
-                container.streams.video[0]
-                if container.streams.video
-                else None
-            )
-            audio_stream = (
-                container.streams.audio[0]
-                if container.streams.audio
-                else None
-            )
+    def _start_read_process(self) -> None:
+        if self._stop_event is None:
+            self._stop_event = self._mp_ctx.Event()
+        self._read_thread = self._mp_ctx.Process(
+            target=_stream_listener_decode_worker,
+            args=(
+                self.url,
+                self.width,
+                self.height,
+                self._stop_event,
+                self._video_mp_queue,
+                self._audio_mp_queue,
+                self._video_drop_count,
+                self._audio_drop_count,
+            ),
+            daemon=True,
+        )
+        self._read_thread.start()
 
-            streams_to_decode = [
-                s for s in [video_stream, audio_stream] if s is not None
-            ]
+    def _stop_read_process(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._read_thread and self._read_thread.is_alive():
+            self._read_thread.join(timeout=5.0)
+        if self._read_thread and self._read_thread.is_alive():
+            self._read_thread.terminate()
+            self._read_thread.join(timeout=5.0)
+        self._read_thread = None
 
-            for frame in container.decode(*streams_to_decode):
-                if not self.is_running:
-                    break
+    def _close_mp_queues(self) -> None:
+        if self._video_mp_queue is not None:
+            try:
+                self._video_mp_queue.close()
+                self._video_mp_queue.join_thread()
+            except Exception:
+                pass
+        if self._audio_mp_queue is not None:
+            try:
+                self._audio_mp_queue.close()
+                self._audio_mp_queue.join_thread()
+            except Exception:
+                pass
+        self._video_mp_queue = None
+        self._audio_mp_queue = None
 
-                self._last_successful_read_time = time.time()
+    def _deserialize_video_frame(self, payload: dict[str, Any]) -> WrappedVideoFrame:
+        frame = av.VideoFrame(
+            payload["width"],
+            payload["height"],
+            payload["format"],
+        )
+        self._apply_common_frame_attrs(frame, payload)
+        self._apply_video_frame_attrs(frame, payload)
+        wrapped = WrappedVideoFrame(frame)
+        wrapped.set_planes(payload["planes"])
+        return wrapped
 
-                if isinstance(frame, av.VideoFrame):
-                    if self.width is not None and self.height is not None:
-                        if frame.width != self.width or frame.height != self.height:
-                            frame = frame.reformat(width=self.width, height=self.height)
-                    wrapped = WrappedVideoFrame(frame)
-                    with self.frame_lock:
-                        self.current_frame = wrapped
-                    self.append_video_queue(wrapped)
+    def _deserialize_audio_frame(self, payload: dict[str, Any]) -> WrappedAudioFrame:
+        frame = av.AudioFrame.from_ndarray(
+            payload["data"],
+            format=payload["format"],
+            layout=payload["layout"],
+        )
+        self._apply_common_frame_attrs(frame, payload)
+        self._apply_audio_frame_attrs(frame, payload)
+        return WrappedAudioFrame(frame)
 
-                elif isinstance(frame, av.AudioFrame):
-                    wrapped = WrappedAudioFrame(frame)
-                    self.append_audio_queue(wrapped)
+    def _apply_common_frame_attrs(self, frame: "av.frame.Frame", payload: dict[str, Any]) -> None:
+        for key in ("pts", "dts", "duration", "side_data", "opaque"):
+            if key in payload:
+                try:
+                    setattr(frame, key, payload[key])
+                except Exception:
+                    pass
+        time_base = payload.get("time_base")
+        if time_base is not None:
+            try:
+                frame.time_base = fractions.Fraction(time_base[0], time_base[1])
+            except Exception:
+                pass
 
-        except Exception as e:
-            print(f"フレーム読み込みエラー: {str(e)}")
-        finally:
+    def _apply_video_frame_attrs(self, frame: av.VideoFrame, payload: dict[str, Any]) -> None:
+        for key in ("pict_type", "colorspace", "color_range"):
+            if key in payload:
+                try:
+                    setattr(frame, key, payload[key])
+                except Exception:
+                    pass
+
+    def _apply_audio_frame_attrs(self, frame: av.AudioFrame, payload: dict[str, Any]) -> None:
+        for key in ("sample_rate", "rate", "samples", "format", "layout"):
+            if key in payload:
+                try:
+                    setattr(frame, key, payload[key])
+                except Exception:
+                    pass
+
+    def _drain_and_monitor(self) -> None:
+        """プロセスから届くフレームを取り込み、監視も行う"""
+        while self.is_running:
+            if self._restart_requested:
+                self._restart_requested = False
+                self._force_restart()
+                continue
+
+            had_data = False
+            had_data |= self._drain_video_queue()
+            had_data |= self._drain_audio_queue()
+
+            if not had_data:
+                time.sleep(0.005)
+
+            if not self.is_running:
+                break
+
+            if self._read_thread and not self._read_thread.is_alive():
+                self._force_restart()
+                continue
+
+            elapsed = time.time() - self._last_successful_read_time
+            if elapsed > self._restart_threshold:
+                print(
+                    f"フレーム更新が{elapsed:.1f}秒間停止。再接続を試みます "
+                    f"(閾値: {self._restart_threshold:.1f}秒)"
+                )
+                self._force_restart()
+
+    def _monitor_frame_updates(self) -> None:
+        """互換性のためのラッパー。旧メソッド名で監視ループを起動する。"""
+        self._drain_and_monitor()
+
+    def _drain_video_queue(self) -> bool:
+        if self._video_mp_queue is None:
+            return False
+        drained = False
+        while True:
+            try:
+                payload = self._video_mp_queue.get_nowait()
+            except queue.Empty:
+                break
+            except (ValueError, OSError):
+                break
+
+            wrapped = self._deserialize_video_frame(payload)
+            with self.frame_lock:
+                self.current_frame = wrapped
+            self.append_video_queue(wrapped)
             self._last_successful_read_time = time.time()
+            drained = True
+        return drained
+
+    def _drain_audio_queue(self) -> bool:
+        if self._audio_mp_queue is None:
+            return False
+        drained = False
+        while True:
+            try:
+                payload = self._audio_mp_queue.get_nowait()
+            except queue.Empty:
+                break
+            except (ValueError, OSError):
+                break
+
+            wrapped = self._deserialize_audio_frame(payload)
+            self.append_audio_queue(wrapped)
+            self._last_successful_read_time = time.time()
+            drained = True
+        return drained
 
     def append_video_queue(self, frame: WrappedVideoFrame) -> None:
         """Videoキューにフレームを追加"""
@@ -205,71 +508,77 @@ class StreamListener:
     def stop(self) -> None:
         """ストリーム処理を停止"""
         self.is_running = False
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=5.0)
-        self._read_thread = None
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=2.0)
         self._monitor_thread = None
+
+        self._stop_read_process()
+        self._close_mp_queues()
+
         with self._restart_lock:
-            if self.container:
+            if self.container is not None:
                 try:
                     self.container.close()
                 except Exception:
                     pass
                 self.container = None
 
-    def _monitor_frame_updates(self) -> None:
-        """フレーム更新を監視し、閾値超過時に再接続を試みる"""
-        while self.is_running:
-            time.sleep(1.0)
-            if not self.is_running:
-                break
+    def _force_restart(self) -> None:
+        with self._restart_lock:
+            if not self.is_running or self._restart_in_progress:
+                return
+            self._restart_in_progress = True
+            self._restart_threshold += self._restart_threshold_increment
+            if self._restart_threshold >= self._restart_threshold_max:
+                print(
+                    f"再接続閾値が上限({self._restart_threshold_max}秒)に達しました。"
+                    "プロセスを終了します。"
+                )
+                os._exit(1)
+        try:
+            self._restart_connection()
+        finally:
+            with self._restart_lock:
+                self._restart_in_progress = False
 
-            elapsed = time.time() - self._last_successful_read_time
-            if elapsed > self._restart_threshold:
-                print(f"フレーム更新が{elapsed:.1f}秒間停止。再接続を試みます (閾値: {self._restart_threshold:.1f}秒)")
-                with self._restart_lock:
-                    if not self.is_running:
-                        break
-                    self._restart_threshold += self._restart_threshold_increment
-                    if self._restart_threshold >= self._restart_threshold_max:
-                        print(f"再接続閾値が上限({self._restart_threshold_max}秒)に達しました。プロセスを終了します。")
-                        os._exit(1)
-                    self._restart_connection()
+    def _request_restart(self) -> None:
+        if not self.is_running:
+            return
+        self._restart_requested = True
+        self._last_successful_read_time = 0.0
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """is_runningチェック付きスリープ。0.5秒間隔で分割。"""
+        remaining = seconds
+        while remaining > 0 and self.is_running:
+            sleep_time = min(remaining, 0.5)
+            time.sleep(sleep_time)
+            remaining -= sleep_time
+
+    def _clear_local_queues(self) -> None:
+        with self.video_queue_lock:
+            self.video_queue.clear()
+        with self.audio_queue_lock:
+            self.audio_queue.clear()
+            self._audio_queue_samples = 0
+        with self.frame_lock:
+            self.current_frame = None
 
     def _restart_connection(self) -> None:
         """ストリーム接続を再確立する。サブクラスでオーバーライド可能。"""
         if not self.is_running:
             return
 
-        # 古いcontainerをclose
-        if self.container:
-            try:
-                self.container.close()
-            except Exception:
-                pass
-            self.container = None
-
-        # 古い読み込みスレッドを待機
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=5.0)
+        self._stop_read_process()
+        self._close_mp_queues()
+        self._interruptible_sleep(self._restart_wait_seconds)
 
         if not self.is_running:
             return
 
-        # 再接続待機
-        time.sleep(self._restart_wait_seconds)
-
-        if not self.is_running:
-            return
-
-        # 新しいcontainerを作成
-        try:
-            self.container = av.open(self.url)
-            self._last_successful_read_time = time.time()
-            self._read_thread = threading.Thread(target=self._read_frames, daemon=True)
-            self._read_thread.start()
-            print("再接続に成功しました")
-        except Exception as e:
-            print(f"再接続エラー: {str(e)}")
+        self._clear_local_queues()
+        self._setup_multiprocessing()
+        self._start_read_process()
+        self.container = _StreamListenerContainerProxy(self._request_restart)
+        self._last_successful_read_time = time.time()
+        print("再接続に成功しました")
