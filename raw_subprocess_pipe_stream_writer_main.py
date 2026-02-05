@@ -38,19 +38,23 @@ WHIP_URL = _env["WHIP_URL"]
 def main() -> None:
     # 1. WHEP受信開始
     print(f"Starting WHEP listener for {WHEP_URL}...")
-    listener = RawSubprocessPipeStreamListener(command=[WHEP_CLIENT, WHEP_URL], width=1600, height=900)
+    listener = RawSubprocessPipeStreamListener(
+        command=[WHEP_CLIENT, WHEP_URL],
+        width=1600,
+        height=900,
+        crop_ratio=0.8,
+    )
     print("WHEP listener started.")
 
     # 2. WHIP送信開始
     print(f"Starting WHIP writer to {WHIP_URL}...")
     writer = RawSubprocessPipeStreamWriter(
         command=[WHIP_CLIENT, WHIP_URL],
-        width=1600,
-        height=900,
+        width=1280,
+        height=720,
         fps=30,
         stats_enabled=True,
     )
-    writer.set_crop_ratio(0.8)
     print("WHIP writer started.")
 
     # 音声は非同期で即座に送信する
@@ -69,7 +73,7 @@ def main() -> None:
     t = time.time()
 
 
-    for i in range(60*30):  # 1分間実行
+    for i in range(30*60):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
