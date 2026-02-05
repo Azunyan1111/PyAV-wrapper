@@ -8,7 +8,7 @@ import pickle
 import queue
 import threading
 import time
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Any
 
 import av
@@ -45,6 +45,18 @@ def _is_picklable(value: Any) -> bool:
 
 _SHM_VIDEO_THRESHOLD_BYTES = 1 << 60
 _SHM_AUDIO_THRESHOLD_BYTES = 1 << 60
+
+
+def _unregister_created_shared_memory(shm_name: str) -> None:
+    if not shm_name:
+        return
+    tracker_name = shm_name
+    if os.name == "posix" and not tracker_name.startswith("/"):
+        tracker_name = f"/{tracker_name}"
+    try:
+        resource_tracker.unregister(tracker_name, "shared_memory")
+    except Exception:
+        pass
 
 
 def _cleanup_payload_shared_memory(payload: Any) -> None:
@@ -99,6 +111,7 @@ def _pack_bytes_to_shared_memory(
             shm.close()
         except Exception:
             pass
+    _unregister_created_shared_memory(shm_name)
 
     return shm_name, spans
 
