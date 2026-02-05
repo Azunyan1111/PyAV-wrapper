@@ -17,6 +17,9 @@ import numpy as np
 from pyav_wrapper.audio_frame import WrappedAudioFrame
 from pyav_wrapper.video_frame import WrappedVideoFrame
 
+if os.name == "posix":
+    import _posixshmem
+
 
 def _serialize_frame_common(frame: "av.frame.Frame") -> dict[str, Any]:
     time_base = None
@@ -59,16 +62,38 @@ def _unregister_created_shared_memory(shm_name: str) -> None:
         pass
 
 
+def _attach_shared_memory(shm_name: str) -> shared_memory.SharedMemory | None:
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    _unregister_created_shared_memory(shm.name)
+    return shm
+
+
 def _close_and_unlink_shared_memory(shm: shared_memory.SharedMemory) -> None:
     shm_name = shm.name
     try:
         shm.close()
     except Exception:
         pass
+    if os.name == "posix":
+        target_name = shm_name
+        if not target_name.startswith("/"):
+            target_name = f"/{target_name}"
+        try:
+            _posixshmem.shm_unlink(target_name)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        return
     try:
         shm.unlink()
     except FileNotFoundError:
-        _unregister_created_shared_memory(shm_name)
+        pass
     except Exception:
         pass
 
@@ -81,11 +106,8 @@ def _cleanup_payload_shared_memory(payload: Any) -> None:
     shm_name = payload.get("shm_name")
     if not isinstance(shm_name, str) or not shm_name:
         return
-    try:
-        shm = shared_memory.SharedMemory(name=shm_name)
-    except FileNotFoundError:
-        return
-    except Exception:
+    shm = _attach_shared_memory(shm_name)
+    if shm is None:
         return
     _close_and_unlink_shared_memory(shm)
 
@@ -474,7 +496,9 @@ class StreamListener:
             if isinstance(shm_name, str) and isinstance(plane_spans, list):
                 shm = None
                 try:
-                    shm = shared_memory.SharedMemory(name=shm_name)
+                    shm = _attach_shared_memory(shm_name)
+                    if shm is None:
+                        return wrapped
                     for i, span in enumerate(plane_spans):
                         if not isinstance(span, (list, tuple)) or len(span) != 2:
                             continue
@@ -525,19 +549,20 @@ class StreamListener:
                     size = int(span[1])
                     shm = None
                     try:
-                        shm = shared_memory.SharedMemory(name=shm_name)
-                        raw = bytes(shm.buf[offset: offset + size])
-                        data = np.frombuffer(raw, dtype=np.dtype(data_dtype)).reshape(tuple(data_shape))
-                        frame = av.AudioFrame.from_ndarray(
-                            data,
-                            format=payload["format"],
-                            layout=payload["layout"],
-                        )
-                        self._apply_common_frame_attrs(frame, payload)
-                        self._apply_audio_frame_attrs(frame, payload)
-                        wrapped = WrappedAudioFrame(frame)
-                        wrapped.set_serialized_payload(payload)
-                        return wrapped
+                        shm = _attach_shared_memory(shm_name)
+                        if shm is not None:
+                            raw = bytes(shm.buf[offset: offset + size])
+                            data = np.frombuffer(raw, dtype=np.dtype(data_dtype)).reshape(tuple(data_shape))
+                            frame = av.AudioFrame.from_ndarray(
+                                data,
+                                format=payload["format"],
+                                layout=payload["layout"],
+                            )
+                            self._apply_common_frame_attrs(frame, payload)
+                            self._apply_audio_frame_attrs(frame, payload)
+                            wrapped = WrappedAudioFrame(frame)
+                            wrapped.set_serialized_payload(payload)
+                            return wrapped
                     finally:
                         if shm is not None:
                             _close_and_unlink_shared_memory(shm)
