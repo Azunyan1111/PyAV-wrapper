@@ -1,13 +1,17 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Source code lives in `src/pyav_wrapper/`, which contains the core wrappers and stream components (e.g., `video_frame.py`, `audio_frame.py`, `stream_listener.py`, `stream_writer.py`). Tests are in `tests/` and follow a `test_*.py` naming scheme, with some integration outputs (e.g., `.mp4`, `.ts`) stored alongside the tests. Root-level scripts like `stream_listener.py` and `raw_subprocess_pipe_stream_writer.py` are used for direct execution or integration experiments. Design notes and background are in `avframe-direct-manipulation.md`.
+Source code lives in `src/pyav_wrapper/`, which contains the core wrappers and stream components (e.g., `video_frame.py`, `audio_frame.py`, `stream_listener.py`, `stream_writer.py`, `raw_subprocess_pipe_stream_listener.py`, `raw_subprocess_pipe_stream_writer.py`). Tests are in `tests/` and follow a `test_*.py` naming scheme; test artifacts (e.g., `.mp4`, `.ts`) may be generated alongside the tests during runs. Design notes and background are in `avframe-direct-manipulation.md`.
 
 ## Build, Test, and Development Commands
 Use `uv` to run the test suite and resolve dependencies. Common targets are provided via `make`:
 `make test` runs the standard test suite (`uv run pytest`).
 `make test-srt` runs SRT end-to-end tests with longer timeouts.
-Targeted commands like `make test-whep` and `make test-whip` run specific raw-subprocess pipe tests.
+`make test-stream` runs the SRT receive + grayscale + SRT stream integration test.
+`make test-output` runs the SRT receive + grayscale + file write integration test.
+`make test-writer-stream` runs the listener-to-writer grayscale stream integration test.
+`make test-whep` runs the raw-subprocess pipe WHEP listener test.
+`make test-whip` runs the raw-subprocess pipe WHIP writer test.
 Python packaging uses `uv_build` (see `pyproject.toml`), and the package requires Python 3.12+.
 
 ## Coding Style & Naming Conventions

@@ -61,8 +61,11 @@ for packet in audio_stream.encode(audio_frame):
 
 ```bash
 make test          # 全テスト実行
-make test-stream   # SRT送信テスト（60秒間グレースケール+音声送信）
-make test-output   # ファイル書き出しテスト（10秒間グレースケール+音声）
+make test-stream   # SRT受信→グレースケール→SRT送信の統合テスト
+make test-output   # SRT受信→グレースケール→ファイル書き出しの統合テスト
+make test-writer-stream  # Listener→Writer 統合テスト（グレースケール+SRT送信）
+make test-whep     # raw-subprocess pipe の WHEP リスナーテスト
+make test-whip     # raw-subprocess pipe の WHIP ライターテスト
 ```
 
 ## 環境変数（.env）

@@ -296,14 +296,17 @@ class StreamWriter:
     def stop(self) -> None:
         """ストリーム処理を停止"""
         self.is_running = False
-        if self._init_thread and self._init_thread.is_alive():
-            self._init_thread.join(timeout=5.0)
+        init_thread = getattr(self, "_init_thread", None)
+        if init_thread and init_thread.is_alive():
+            init_thread.join(timeout=5.0)
         self._init_thread = None
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
+        thread = getattr(self, "_thread", None)
+        if thread and thread.is_alive():
+            thread.join(timeout=5.0)
         self._thread = None
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=10.0)
+        monitor_thread = getattr(self, "_monitor_thread", None)
+        if monitor_thread and monitor_thread.is_alive():
+            monitor_thread.join(timeout=10.0)
         self._monitor_thread = None
 
     def _monitor_write_updates(self) -> None:

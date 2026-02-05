@@ -95,14 +95,15 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
     def stop(self) -> None:
         """ストリーム処理とサブプロセスを停止"""
         super().stop()
-        if self._process is not None:
+        process = getattr(self, "_process", None)
+        if process is not None:
             try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
+                process.terminate()
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            self._process = None
+                process.kill()
+                process.wait()
+        self._process = None
 
     def _restart_connection(self) -> bool:
         """サブプロセスパイプ接続を再確立する。

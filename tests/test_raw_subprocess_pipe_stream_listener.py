@@ -1,7 +1,10 @@
+import fcntl
 import os
 import shutil
+import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from dotenv import load_dotenv
@@ -15,20 +18,39 @@ from pyav_wrapper import (
 
 load_dotenv()
 
+WHIP_URL = os.getenv("WHIP_URL")
 WHEP_URL = os.getenv("WHEP_URL")
+WHIP_CLIENT_PATH = "./deps/whip-client"
 WHEP_CLIENT_PATH = "./deps/whep-client"
+MOVIE_FILE = Path(__file__).parent.parent / "deps" / "test" / "movie.mp4"
+LOCK_FILE_PATH = "/tmp/pyav_wrapper_whip_whep.lock"
 
 
 def check_whep_available() -> bool:
-    """whep-clientバイナリとWHEP_URLが利用可能か確認"""
-    if WHEP_URL is None:
+    """whip-client/whep-clientバイナリとWHIP/WHEP URL/テスト動画が利用可能か確認"""
+    if WHEP_URL is None or WHIP_URL is None:
         return False
     if not shutil.which(WHEP_CLIENT_PATH) and not os.path.isfile(WHEP_CLIENT_PATH):
+        return False
+    if not shutil.which(WHIP_CLIENT_PATH) and not os.path.isfile(WHIP_CLIENT_PATH):
+        return False
+    if not MOVIE_FILE.exists():
         return False
     return True
 
 
 WHEP_AVAILABLE = check_whep_available()
+
+
+class _WhipWhepLock:
+    def __enter__(self):
+        self._lock_file = open(LOCK_FILE_PATH, "w")
+        fcntl.flock(self._lock_file, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+        self._lock_file.close()
 
 
 class TestRawSubprocessPipeStreamListenerInit:
@@ -72,69 +94,109 @@ class TestRawSubprocessPipeStreamListenerReconnection:
 
 @pytest.mark.skipif(
     not WHEP_AVAILABLE,
-    reason="whep-clientバイナリまたはWHEP_URL環境変数が利用できません",
+    reason="whip-client/whep-clientバイナリ、WHIP_URL/WHEP_URL環境変数、またはテスト動画が利用できません",
 )
 class TestRawSubprocessPipeStreamListenerIntegration:
     """WHEP統合テスト：サブプロセスパイプ経由でフレームを受信"""
 
+    @pytest.mark.timeout(120)
     def test_receive_video_and_audio_from_pipe(self):
         """whep-clientからパイプ経由で映像・音声フレームを受信できる"""
-        command = [WHEP_CLIENT_PATH, WHEP_URL]
-        listener = RawSubprocessPipeStreamListener(command=command, width=640, height=480)
+        listener = None
+        with _WhipWhepLock():
+            ffmpeg_proc = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-re",
+                    "-stream_loop", "-1",
+                    "-i", str(MOVIE_FILE),
+                    "-c:v", "rawvideo",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "pcm_s16le",
+                    "-f", "matroska",
+                    "-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            whip_source_proc = subprocess.Popen(
+                [WHIP_CLIENT_PATH, WHIP_URL],
+                stdin=ffmpeg_proc.stdout,
+                stderr=subprocess.PIPE,
+            )
+            ffmpeg_proc.stdout.close()
 
-        time.sleep(10.0)
+            try:
+                time.sleep(10.0)
 
-        assert listener.is_running is True
+                command = [WHEP_CLIENT_PATH, WHEP_URL]
+                listener = RawSubprocessPipeStreamListener(command=command, width=640, height=480)
 
-        video_frames = []
-        for _ in range(20):
-            frames = listener.pop_all_video_queue()
-            if frames:
-                video_frames.extend(frames)
-                break
-            time.sleep(0.5)
+                time.sleep(10.0)
 
-        if len(video_frames) == 0:
-            with listener.video_queue_lock:
-                video_frames = list(listener.video_queue)
+                assert listener.is_running is True
 
-        assert len(video_frames) > 0, "映像フレームを受信できませんでした"
+                video_frames = []
+                for _ in range(20):
+                    frames = listener.pop_all_video_queue()
+                    if frames:
+                        video_frames.extend(frames)
+                        break
+                    time.sleep(0.5)
 
-        frame = video_frames[0]
-        assert isinstance(frame, WrappedVideoFrame)
-        assert frame.frame.width > 0
-        assert frame.frame.height > 0
+                if len(video_frames) == 0:
+                    with listener.video_queue_lock:
+                        video_frames = list(listener.video_queue)
 
-        buffer = frame.get_buffer()
-        assert buffer is not None
-        assert buffer.shape[0] > 0
-        assert buffer.shape[1] > 0
+                assert len(video_frames) > 0, "映像フレームを受信できませんでした"
 
-        planes = frame.get_planes()
-        assert len(planes) > 0
+                frame = video_frames[0]
+                assert isinstance(frame, WrappedVideoFrame)
+                assert frame.frame.width > 0
+                assert frame.frame.height > 0
 
-        audio_frames = []
-        for _ in range(20):
-            frames = listener.pop_all_audio_queue()
-            if frames:
-                audio_frames.extend(frames)
-                break
-            time.sleep(0.5)
+                buffer = frame.get_buffer()
+                assert buffer is not None
+                assert buffer.shape[0] > 0
+                assert buffer.shape[1] > 0
 
-        if len(audio_frames) == 0:
-            with listener.audio_queue_lock:
-                audio_frames = list(listener.audio_queue)
+                planes = frame.get_planes()
+                assert len(planes) > 0
 
-        assert len(audio_frames) > 0, "音声フレームを受信できませんでした"
+                audio_frames = []
+                for _ in range(20):
+                    frames = listener.pop_all_audio_queue()
+                    if frames:
+                        audio_frames.extend(frames)
+                        break
+                    time.sleep(0.5)
 
-        audio = audio_frames[0]
-        assert isinstance(audio, WrappedAudioFrame)
-        assert audio.frame.sample_rate > 0
+                if len(audio_frames) == 0:
+                    with listener.audio_queue_lock:
+                        audio_frames = list(listener.audio_queue)
 
-        audio_buffer = audio.get_buffer()
-        assert audio_buffer is not None
-        assert audio_buffer.shape[0] > 0
+                assert len(audio_frames) > 0, "音声フレームを受信できませんでした"
 
-        listener.stop()
+                audio = audio_frames[0]
+                assert isinstance(audio, WrappedAudioFrame)
+                assert audio.frame.sample_rate > 0
 
-        assert listener.is_running is False
+                audio_buffer = audio.get_buffer()
+                assert audio_buffer is not None
+                assert audio_buffer.shape[0] > 0
+
+                listener.stop()
+
+                assert listener.is_running is False
+            finally:
+                if listener is not None:
+                    listener.stop()
+                for proc in [whip_source_proc, ffmpeg_proc]:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    except Exception:
+                        pass

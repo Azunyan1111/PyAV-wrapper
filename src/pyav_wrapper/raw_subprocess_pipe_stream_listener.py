@@ -30,6 +30,9 @@ class RawSubprocessPipeStreamListener(StreamListener):
         """
         self._command = command
         self._process: subprocess.Popen | None = None
+        self._start_timeout_seconds = 15.0
+        self._start_retry_interval_seconds = 1.0
+        self._start_error: str | None = None
         super().__init__(
             url="pipe:",
             width=width,
@@ -39,6 +42,27 @@ class RawSubprocessPipeStreamListener(StreamListener):
             audio_layout=audio_layout,
         )
 
+    def _open_container_with_retry(self) -> av.container.Container | None:
+        """MKVコンテナをリトライ付きでopenする"""
+        deadline = time.monotonic() + self._start_timeout_seconds
+        last_error: str | None = None
+        while time.monotonic() < deadline:
+            if self._process is None:
+                last_error = "サブプロセスが起動していません"
+                break
+            if self._process.poll() is not None:
+                last_error = f"サブプロセスが終了しました (returncode={self._process.returncode})"
+                break
+            try:
+                container = av.open(self._process.stdout, format="matroska", mode="r")
+                self._start_error = None
+                return container
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(self._start_retry_interval_seconds)
+        self._start_error = last_error
+        return None
+
     def start_processing(self) -> str:
         """サブプロセスを起動し、stdoutパイプからストリーム処理を開始"""
         try:
@@ -47,7 +71,10 @@ class RawSubprocessPipeStreamListener(StreamListener):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            self.container = av.open(self._process.stdout, format="matroska", mode="r")
+            container = self._open_container_with_retry()
+            if container is None:
+                raise RuntimeError(self._start_error or "コンテナのopenに失敗しました")
+            self.container = container
             self.is_running = True
             self._last_successful_read_time = time.time()
             self._read_thread = threading.Thread(target=self._read_frames, daemon=True)
@@ -119,7 +146,10 @@ class RawSubprocessPipeStreamListener(StreamListener):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            self.container = av.open(self._process.stdout, format="matroska", mode="r")
+            container = self._open_container_with_retry()
+            if container is None:
+                raise RuntimeError(self._start_error or "コンテナのopenに失敗しました")
+            self.container = container
             self._last_successful_read_time = time.time()
             self._read_thread = threading.Thread(target=self._read_frames, daemon=True)
             self._read_thread.start()
