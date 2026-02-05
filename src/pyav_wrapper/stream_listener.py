@@ -59,6 +59,20 @@ def _unregister_created_shared_memory(shm_name: str) -> None:
         pass
 
 
+def _close_and_unlink_shared_memory(shm: shared_memory.SharedMemory) -> None:
+    shm_name = shm.name
+    try:
+        shm.close()
+    except Exception:
+        pass
+    try:
+        shm.unlink()
+    except FileNotFoundError:
+        _unregister_created_shared_memory(shm_name)
+    except Exception:
+        pass
+
+
 def _cleanup_payload_shared_memory(payload: Any) -> None:
     if not isinstance(payload, dict):
         return
@@ -73,16 +87,7 @@ def _cleanup_payload_shared_memory(payload: Any) -> None:
         return
     except Exception:
         return
-    try:
-        shm.close()
-    except Exception:
-        pass
-    try:
-        shm.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    _close_and_unlink_shared_memory(shm)
 
 
 def _pack_bytes_to_shared_memory(
@@ -483,14 +488,7 @@ class StreamListener:
                     pass
                 finally:
                     if shm is not None:
-                        try:
-                            shm.close()
-                        except Exception:
-                            pass
-                        try:
-                            shm.unlink()
-                        except Exception:
-                            pass
+                        _close_and_unlink_shared_memory(shm)
                     else:
                         _cleanup_payload_shared_memory(payload)
         else:
@@ -542,14 +540,7 @@ class StreamListener:
                         return wrapped
                     finally:
                         if shm is not None:
-                            try:
-                                shm.close()
-                            except Exception:
-                                pass
-                            try:
-                                shm.unlink()
-                            except Exception:
-                                pass
+                            _close_and_unlink_shared_memory(shm)
                         else:
                             _cleanup_payload_shared_memory(payload)
         frame = av.AudioFrame.from_ndarray(
