@@ -10,6 +10,8 @@ from pyav_wrapper.stream_listener import (
     _serialize_video_frame,
 )
 
+DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_listener.log"
+
 
 def _raw_subprocess_pipe_decode_worker(
     command: list[str],
@@ -22,14 +24,22 @@ def _raw_subprocess_pipe_decode_worker(
     audio_drop_count: int,
     start_timeout_seconds: float,
     start_retry_interval_seconds: float,
+    stderr_log_path: str | None,
 ) -> None:
     process: subprocess.Popen | None = None
     container: av.container.Container | None = None
+    stderr_file = None
     try:
+        if stderr_log_path is not None:
+            stderr_file = open(stderr_log_path, "a")
+            stderr_dest = stderr_file
+        else:
+            stderr_dest = subprocess.DEVNULL
+
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr_dest,
         )
 
         deadline = time.monotonic() + start_timeout_seconds
@@ -92,8 +102,6 @@ def _raw_subprocess_pipe_decode_worker(
             try:
                 if process.stdout:
                     process.stdout.close()
-                if process.stderr:
-                    process.stderr.close()
             except Exception:
                 pass
             try:
@@ -102,6 +110,11 @@ def _raw_subprocess_pipe_decode_worker(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+            except Exception:
+                pass
+        if stderr_file is not None:
+            try:
+                stderr_file.close()
             except Exception:
                 pass
 
@@ -117,6 +130,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
         fps: int = 30,
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
+        stderr_log_path: str | None = None,
     ):
         """
         Args:
@@ -126,12 +140,15 @@ class RawSubprocessPipeStreamListener(StreamListener):
             fps: 想定フレームレート（保持用）
             sample_rate: 想定音声サンプルレート（保持用）
             audio_layout: 想定音声チャンネルレイアウト（保持用）
+            stderr_log_path: サブプロセスのstderr出力先ファイルパス
+                            Noneの場合は出力しない
         """
         self._command = command
         self._process: subprocess.Popen | None = None
         self._start_timeout_seconds = 15.0
         self._start_retry_interval_seconds = 1.0
         self._start_error: str | None = None
+        self._stderr_log_path = stderr_log_path
         super().__init__(
             url="pipe:",
             width=width,
@@ -140,6 +157,15 @@ class RawSubprocessPipeStreamListener(StreamListener):
             sample_rate=sample_rate,
             audio_layout=audio_layout,
         )
+
+    def set_stderr_log_path(self, path: str | None) -> None:
+        """サブプロセスのstderr出力先ファイルパスを設定する
+
+        Args:
+            path: 出力先ファイルパス。Noneの場合は出力しない。
+                  次回のプロセス起動時から有効。
+        """
+        self._stderr_log_path = path
 
     def _start_read_process(self) -> None:
         if self._stop_event is None:
@@ -157,6 +183,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
                 self._audio_drop_count,
                 self._start_timeout_seconds,
                 self._start_retry_interval_seconds,
+                self._stderr_log_path,
             ),
             daemon=True,
         )

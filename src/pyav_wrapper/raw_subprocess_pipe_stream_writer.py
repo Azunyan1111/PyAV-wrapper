@@ -8,6 +8,8 @@ import av
 
 from pyav_wrapper.stream_writer import StreamWriter
 
+DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_writer.log"
+
 
 class RawSubprocessPipeStreamWriter(StreamWriter):
     """サブプロセスのstdinパイプへMKV形式のrawvideo+PCMを書き込むStreamWriter"""
@@ -20,6 +22,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             fps: int = 30,
             sample_rate: int = 48000,
             audio_layout: str = "stereo",
+            stderr_log_path: str | None = None,
     ):
         """
         Args:
@@ -29,9 +32,13 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             fps: 出力フレームレート
             sample_rate: 音声サンプルレート（デフォルト: 48000）
             audio_layout: 音声チャンネルレイアウト（デフォルト: "stereo"）
+            stderr_log_path: サブプロセスのstderr出力先ファイルパス
+                            Noneの場合は出力しない
         """
         self._command = command
         self._process: subprocess.Popen | None = None
+        self._stderr_log_path = stderr_log_path
+        self._stderr_file = None
         super().__init__(
             url="pipe:",
             width=width,
@@ -40,6 +47,31 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             sample_rate=sample_rate,
             audio_layout=audio_layout,
         )
+
+    def set_stderr_log_path(self, path: str | None) -> None:
+        """サブプロセスのstderr出力先ファイルパスを設定する
+
+        Args:
+            path: 出力先ファイルパス。Noneの場合は出力しない。
+                  次回のプロセス起動時から有効。
+        """
+        self._stderr_log_path = path
+
+    def _open_stderr_file(self):
+        """stderrログファイルを開く"""
+        if self._stderr_log_path is not None:
+            self._stderr_file = open(self._stderr_log_path, "a")
+            return self._stderr_file
+        return subprocess.DEVNULL
+
+    def _close_stderr_file(self):
+        """stderrログファイルを閉じる"""
+        if self._stderr_file is not None:
+            try:
+                self._stderr_file.close()
+            except Exception:
+                pass
+            self._stderr_file = None
 
     def start_processing(self) -> str:
         """サブプロセスを起動し、stdinパイプへストリーム書き込みを開始"""
@@ -55,10 +87,11 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             self._first_frame = first_frame
 
             # サブプロセスを起動
+            stderr_dest = self._open_stderr_file()
             self._process = subprocess.Popen(
                 self._command,
                 stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=stderr_dest,
             )
 
             # stdinパイプをMKVコンテナとして開く
@@ -104,6 +137,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
                 process.kill()
                 process.wait()
         self._process = None
+        self._close_stderr_file()
 
     def _restart_connection(self) -> bool:
         """サブプロセスパイプ接続を再確立する。
@@ -150,10 +184,11 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
         # 新しいサブプロセスを起動
         try:
+            stderr_dest = self._open_stderr_file()
             self._process = subprocess.Popen(
                 self._command,
                 stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=stderr_dest,
             )
 
             # stdinパイプをMKVコンテナとして開く
@@ -187,4 +222,5 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
                 except Exception:
                     pass
                 self._process = None
+            self._close_stderr_file()
             return False
