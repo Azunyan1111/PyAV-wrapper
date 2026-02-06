@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fractions
 import multiprocessing
-import os
 import pickle
 import queue
 from multiprocessing import shared_memory
@@ -47,8 +46,8 @@ def _is_picklable(value: Any) -> bool:
         return False
 
 
-_SHM_VIDEO_THRESHOLD_BYTES = 256 * 1024
-_SHM_AUDIO_THRESHOLD_BYTES = 64 * 1024
+_SHM_VIDEO_THRESHOLD_BYTES = 1 << 60
+_SHM_AUDIO_THRESHOLD_BYTES = 1 << 60
 
 
 def _cleanup_payload_shared_memory(payload: Any) -> None:

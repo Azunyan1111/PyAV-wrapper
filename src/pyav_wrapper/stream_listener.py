@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import fractions
 import multiprocessing
-import os
 import pickle
 import queue
 import threading
@@ -314,8 +313,12 @@ class StreamListener:
 
         # Video
         self.batch_size = fps
+        video_queue_maxlen = int(self.batch_size * 1.7)
+        # 高解像度時はキュー上限を抑え、メモリ増大によるプロセス終了を防ぐ
+        if self.width * self.height >= 1280 * 720:
+            video_queue_maxlen = min(video_queue_maxlen, self.batch_size)
         self.video_queue: collections.deque[WrappedVideoFrame] = collections.deque(
-            maxlen=int(self.batch_size * 1.7)
+            maxlen=video_queue_maxlen
         )
         self.video_queue_lock = threading.Lock()
         self.frame_lock = threading.Lock()
@@ -334,8 +337,8 @@ class StreamListener:
         self._stop_event: multiprocessing.Event | None = None
         self._video_mp_queue: multiprocessing.Queue | None = None
         self._audio_mp_queue: multiprocessing.Queue | None = None
-        self._video_mp_queue_maxlen = int(self.batch_size * 1.7)
-        self._audio_mp_queue_maxlen = int(self.batch_size * 1.7)
+        self._video_mp_queue_maxlen = video_queue_maxlen
+        self._audio_mp_queue_maxlen = video_queue_maxlen
         self._video_drop_count = max(1, self._video_mp_queue_maxlen // 10)
         self._audio_drop_count = max(1, self._audio_mp_queue_maxlen // 10)
 
@@ -491,7 +494,6 @@ class StreamListener:
                             frame.planes[i].update(plane_data)
                     except Exception:
                         continue
-        wrapped.set_serialized_payload(payload)
         return wrapped
 
     def _deserialize_audio_frame(self, payload: dict[str, Any]) -> WrappedAudioFrame:
@@ -525,7 +527,6 @@ class StreamListener:
                         self._apply_common_frame_attrs(frame, payload)
                         self._apply_audio_frame_attrs(frame, payload)
                         wrapped = WrappedAudioFrame(frame)
-                        wrapped.set_serialized_payload(payload)
                         return wrapped
                     finally:
                         if shm is not None:
@@ -546,9 +547,7 @@ class StreamListener:
         )
         self._apply_common_frame_attrs(frame, payload)
         self._apply_audio_frame_attrs(frame, payload)
-        wrapped = WrappedAudioFrame(frame)
-        wrapped.set_serialized_payload(payload)
-        return wrapped
+        return WrappedAudioFrame(frame)
 
     def _apply_common_frame_attrs(self, frame: "av.frame.Frame", payload: dict[str, Any]) -> None:
         for key in ("pts", "dts", "duration", "side_data", "opaque"):
