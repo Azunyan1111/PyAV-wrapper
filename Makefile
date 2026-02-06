@@ -1,4 +1,4 @@
-.PHONY: test test-srt test-stream test-output test-writer-stream test-whep
+.PHONY: test test-srt test-stream test-output test-writer-stream test-whep docker-build docker-run
 
 test:
 	uv run pytest
@@ -20,3 +20,12 @@ test-whep:
 
 test-whip:
 	uv run pytest tests/test_raw_subprocess_pipe_stream_writer.py -v -s --timeout 120
+
+docker-build:
+	docker build -t pyav-wrapper -f Dockerfile .
+
+docker-run: docker-build
+	docker context use rtx4090
+	docker stop pyav-wrapper || true
+	docker rm pyav-wrapper || true
+	docker run --rm -t --gpus=all --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all --name pyav-wrapper pyav-wrapper
