@@ -21,9 +21,6 @@ from pyav_wrapper.video_frame import WrappedVideoFrame
 if TYPE_CHECKING:
     from threading import Thread
 
-if os.name == "posix":
-    import _posixshmem
-
 
 def _serialize_frame_common(frame: "av.frame.Frame") -> dict[str, Any]:
     time_base = None
@@ -66,38 +63,16 @@ def _unregister_created_shared_memory(shm_name: str) -> None:
         pass
 
 
-def _attach_shared_memory(shm_name: str) -> shared_memory.SharedMemory | None:
-    try:
-        shm = shared_memory.SharedMemory(name=shm_name)
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-    _unregister_created_shared_memory(shm.name)
-    return shm
-
-
 def _close_and_unlink_shared_memory(shm: shared_memory.SharedMemory) -> None:
     shm_name = shm.name
     try:
         shm.close()
     except Exception:
         pass
-    if os.name == "posix":
-        target_name = shm_name
-        if not target_name.startswith("/"):
-            target_name = f"/{target_name}"
-        try:
-            _posixshmem.shm_unlink(target_name)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-        return
     try:
         shm.unlink()
     except FileNotFoundError:
-        pass
+        _unregister_created_shared_memory(shm_name)
     except Exception:
         pass
 
@@ -114,8 +89,11 @@ def _cleanup_payload_shared_memory(payload: Any) -> None:
     shm_name = payload.get("shm_name")
     if not isinstance(shm_name, str) or not shm_name:
         return
-    shm = _attach_shared_memory(shm_name)
-    if shm is None:
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+    except FileNotFoundError:
+        return
+    except Exception:
         return
     _close_and_unlink_shared_memory(shm)
 
@@ -282,9 +260,7 @@ def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
         if isinstance(shm_name, str) and isinstance(plane_spans, list):
             shm = None
             try:
-                shm = _attach_shared_memory(shm_name)
-                if shm is None:
-                    return wrapped
+                shm = shared_memory.SharedMemory(name=shm_name)
                 for i, span in enumerate(plane_spans):
                     if not isinstance(span, (list, tuple)) or len(span) != 2:
                         continue
@@ -333,18 +309,17 @@ def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
                 size = int(span[1])
                 shm = None
                 try:
-                    shm = _attach_shared_memory(shm_name)
-                    if shm is not None:
-                        raw = bytes(shm.buf[offset: offset + size])
-                        data = np.frombuffer(raw, dtype=np.dtype(data_dtype)).reshape(tuple(data_shape))
-                        frame = av.AudioFrame.from_ndarray(
-                            data,
-                            format=payload["format"],
-                            layout=payload["layout"],
-                        )
-                        _apply_common_frame_attrs(frame, payload)
-                        _apply_audio_frame_attrs(frame, payload)
-                        return WrappedAudioFrame(frame)
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    raw = bytes(shm.buf[offset: offset + size])
+                    data = np.frombuffer(raw, dtype=np.dtype(data_dtype)).reshape(tuple(data_shape))
+                    frame = av.AudioFrame.from_ndarray(
+                        data,
+                        format=payload["format"],
+                        layout=payload["layout"],
+                    )
+                    _apply_common_frame_attrs(frame, payload)
+                    _apply_audio_frame_attrs(frame, payload)
+                    return WrappedAudioFrame(frame)
                 finally:
                     if shm is not None:
                         _close_and_unlink_shared_memory(shm)
@@ -411,24 +386,6 @@ def _drop_if_full(
     except NotImplementedError:
         return True
     except (ValueError, OSError):
-        return False
-
-
-def _is_process_alive(process: multiprocessing.Process | None) -> bool:
-    if process is None:
-        return False
-    try:
-        return process.is_alive()
-    except (AssertionError, ValueError, OSError):
-        return False
-
-
-def _is_thread_alive(thread: Any) -> bool:
-    if thread is None:
-        return False
-    try:
-        return bool(thread.is_alive())
-    except Exception:
         return False
 
 
@@ -723,7 +680,6 @@ class StreamWriter:
 
         # 古いフレームの保持
         self._last_video_frame: WrappedVideoFrame | None = None
-        self._owner_pid = os.getpid()
 
         # Reconnection
         self._last_successful_write_time: float = 0.0
@@ -1081,9 +1037,9 @@ class StreamWriter:
         stop_event = getattr(self, "_stop_event", None)
         if stop_event is not None:
             stop_event.set()
-        if _is_process_alive(self._write_process):
+        if self._write_process and self._write_process.is_alive():
             self._write_process.join(timeout=5.0)
-        if _is_process_alive(self._write_process):
+        if self._write_process and self._write_process.is_alive():
             self._write_process.terminate()
             self._write_process.join(timeout=5.0)
         self._write_process = None
@@ -1231,7 +1187,7 @@ class StreamWriter:
                     self._stop_write_process()
                     time.sleep(0.1)
                     continue
-                if write_process and not _is_process_alive(write_process):
+                if write_process and not write_process.is_alive():
                     self._force_restart()
 
             if self._last_successful_write_time > 0.0:
@@ -1362,7 +1318,7 @@ class StreamWriter:
         # 古い書込プロセス/スレッドを待機
         if self._write_process is not None:
             self._stop_write_process()
-        elif _is_thread_alive(self._thread):
+        elif self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
             self._thread = None
 
@@ -1397,16 +1353,14 @@ class StreamWriter:
 
     def stop(self) -> None:
         """ストリーム処理を停止"""
-        if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
-            return
         self.is_running = False
         init_thread = getattr(self, "_init_thread", None)
-        if _is_thread_alive(init_thread):
+        if init_thread and init_thread.is_alive():
             init_thread.join(timeout=5.0)
         self._init_thread = None
 
         monitor_thread = getattr(self, "_monitor_thread", None)
-        if _is_thread_alive(monitor_thread):
+        if monitor_thread and monitor_thread.is_alive():
             monitor_thread.join(timeout=10.0)
         self._monitor_thread = None
 
@@ -1415,7 +1369,7 @@ class StreamWriter:
             self._stop_write_process()
         else:
             thread = getattr(self, "_thread", None)
-            if _is_thread_alive(thread):
+            if thread and thread.is_alive():
                 thread.join(timeout=5.0)
             self._thread = None
 
@@ -1423,12 +1377,7 @@ class StreamWriter:
 
     def __del__(self) -> None:
         """リソース解放"""
-        try:
-            if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
-                return
-            self.stop()
-        except Exception:
-            pass
+        self.stop()
 
     def _process_video_frame(self) -> WrappedVideoFrame | None:
         """映像フレームを取得
