@@ -73,7 +73,7 @@ def main() -> None:
     t = time.time()
 
 
-    for i in range(45*240):  # 1分間実行
+    for i in range(15*240):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
