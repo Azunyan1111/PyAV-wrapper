@@ -29,7 +29,7 @@ def _serialize_frame_common(frame: "av.frame.Frame") -> dict[str, Any]:
         "time_base": time_base,
     }
     opaque = frame.opaque
-    if _is_picklable(opaque):
+    if opaque is not None and _is_picklable(opaque):
         payload["opaque"] = opaque
     return payload
 
@@ -47,6 +47,10 @@ _SHM_AUDIO_THRESHOLD_BYTES = 1 << 60
 
 
 def _cleanup_payload_shared_memory(payload: Any) -> None:
+    if isinstance(payload, list):
+        for item in payload:
+            _cleanup_payload_shared_memory(item)
+        return
     if not isinstance(payload, dict):
         return
     if payload.get("storage") != "shm":
@@ -135,28 +139,23 @@ def _serialize_video_frame(frame: av.VideoFrame) -> dict[str, Any]:
 
 
 def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
-    data = np.ascontiguousarray(frame.to_ndarray())
-    raw_bytes = data.tobytes()
-    shm_payload = _pack_bytes_to_shared_memory([raw_bytes], _SHM_AUDIO_THRESHOLD_BYTES)
-
     payload = _serialize_frame_common(frame)
-    if shm_payload is None:
-        payload.update(
-            {
-                "format": frame.format.name,
-                "layout": frame.layout.name,
-                "sample_rate": frame.sample_rate,
-                "rate": frame.rate,
-                "samples": frame.samples,
-                "data": data,
-                "storage": "inline",
-                "shm_name": None,
-                "data_spans": None,
-            }
-        )
-        return payload
+    planes: list[bytes] | None = []
+    for plane in frame.planes:
+        planes.append(bytes(plane))
 
-    shm_name, data_spans = shm_payload
+    storage = "inline"
+    shm_name: str | None = None
+    plane_spans: list[tuple[int, int]] | None = None
+    if planes is not None and _SHM_AUDIO_THRESHOLD_BYTES > 0:
+        total_size = sum(len(plane) for plane in planes)
+        if total_size >= _SHM_AUDIO_THRESHOLD_BYTES:
+            shm_payload = _pack_bytes_to_shared_memory(planes, _SHM_AUDIO_THRESHOLD_BYTES)
+            if shm_payload is not None:
+                shm_name, plane_spans = shm_payload
+                planes = None
+                storage = "shm"
+
     payload.update(
         {
             "format": frame.format.name,
@@ -164,12 +163,12 @@ def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
             "sample_rate": frame.sample_rate,
             "rate": frame.rate,
             "samples": frame.samples,
-            "data": None,
-            "storage": "shm",
+            "planes": planes,
+            "plane_spans": plane_spans,
+            "storage": storage,
             "shm_name": shm_name,
-            "data_spans": data_spans,
-            "data_shape": data.shape,
-            "data_dtype": str(data.dtype),
+            "data": None,
+            "data_spans": None,
         }
     )
     return payload
@@ -177,7 +176,7 @@ def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
 
 def _put_with_drop(
     target_queue: multiprocessing.Queue,
-    item: dict[str, Any],
+    item: Any,
     drop_count: int,
 ) -> None:
     try:
@@ -497,9 +496,65 @@ class StreamListener:
         return wrapped
 
     def _deserialize_audio_frame(self, payload: dict[str, Any]) -> WrappedAudioFrame:
+        planes = payload.get("planes")
+        if isinstance(planes, list):
+            frame = av.AudioFrame(
+                format=payload["format"],
+                layout=payload["layout"],
+                samples=payload["samples"],
+            )
+            for i, plane_data in enumerate(planes):
+                try:
+                    frame.planes[i].update(plane_data)
+                except Exception:
+                    continue
+            self._apply_common_frame_attrs(frame, payload)
+            self._apply_audio_frame_attrs(frame, payload)
+            return WrappedAudioFrame(frame)
+
         storage = payload.get("storage", "inline")
         if storage == "shm":
             shm_name = payload.get("shm_name")
+            plane_spans = payload.get("plane_spans")
+            if (
+                isinstance(shm_name, str)
+                and isinstance(plane_spans, list)
+                and plane_spans
+            ):
+                shm = None
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    frame = av.AudioFrame(
+                        format=payload["format"],
+                        layout=payload["layout"],
+                        samples=payload["samples"],
+                    )
+                    for i, span in enumerate(plane_spans):
+                        if not isinstance(span, (list, tuple)) or len(span) != 2:
+                            continue
+                        offset = int(span[0])
+                        size = int(span[1])
+                        try:
+                            frame.planes[i].update(shm.buf[offset: offset + size])
+                        except Exception:
+                            continue
+                    self._apply_common_frame_attrs(frame, payload)
+                    self._apply_audio_frame_attrs(frame, payload)
+                    wrapped = WrappedAudioFrame(frame)
+                    return wrapped
+                finally:
+                    if shm is not None:
+                        try:
+                            shm.close()
+                        except Exception:
+                            pass
+                        try:
+                            shm.unlink()
+                        except Exception:
+                            pass
+                    else:
+                        _cleanup_payload_shared_memory(payload)
+
             data_spans = payload.get("data_spans")
             data_shape = payload.get("data_shape")
             data_dtype = payload.get("data_dtype")
@@ -629,40 +684,62 @@ class StreamListener:
         if self._video_mp_queue is None:
             return False
         drained = False
+
+        def _iter_payloads(payload_obj: Any):
+            if isinstance(payload_obj, dict):
+                yield payload_obj
+                return
+            if isinstance(payload_obj, list):
+                for payload in payload_obj:
+                    if isinstance(payload, dict):
+                        yield payload
+
         while True:
             try:
-                payload = self._video_mp_queue.get_nowait()
+                payload_obj = self._video_mp_queue.get_nowait()
             except queue.Empty:
                 break
             except (ValueError, OSError):
                 break
 
-            wrapped = self._deserialize_video_frame(payload)
-            with self.frame_lock:
-                self.current_frame = wrapped
-            self.append_video_queue(wrapped)
-            self._last_successful_read_time = time.time()
-            self._stats_video_frame_count += 1
-            drained = True
+            for payload in _iter_payloads(payload_obj):
+                wrapped = self._deserialize_video_frame(payload)
+                with self.frame_lock:
+                    self.current_frame = wrapped
+                self.append_video_queue(wrapped)
+                self._last_successful_read_time = time.time()
+                self._stats_video_frame_count += 1
+                drained = True
         return drained
 
     def _drain_audio_queue(self) -> bool:
         if self._audio_mp_queue is None:
             return False
         drained = False
+
+        def _iter_payloads(payload_obj: Any):
+            if isinstance(payload_obj, dict):
+                yield payload_obj
+                return
+            if isinstance(payload_obj, list):
+                for payload in payload_obj:
+                    if isinstance(payload, dict):
+                        yield payload
+
         while True:
             try:
-                payload = self._audio_mp_queue.get_nowait()
+                payload_obj = self._audio_mp_queue.get_nowait()
             except queue.Empty:
                 break
             except (ValueError, OSError):
                 break
 
-            wrapped = self._deserialize_audio_frame(payload)
-            self.append_audio_queue(wrapped)
-            self._last_successful_read_time = time.time()
-            self._stats_audio_frame_count += 1
-            drained = True
+            for payload in _iter_payloads(payload_obj):
+                wrapped = self._deserialize_audio_frame(payload)
+                self.append_audio_queue(wrapped)
+                self._last_successful_read_time = time.time()
+                self._stats_audio_frame_count += 1
+                drained = True
         return drained
 
     def append_video_queue(self, frame: WrappedVideoFrame) -> None:

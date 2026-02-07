@@ -12,6 +12,8 @@ from pyav_wrapper.stream_listener import (
 from pyav_wrapper.video_frame import WrappedVideoFrame
 
 DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_listener.log"
+_VIDEO_PAYLOAD_BATCH_SIZE = 4
+_AUDIO_PAYLOAD_BATCH_SIZE = 16
 
 
 def _raw_subprocess_pipe_decode_worker(
@@ -31,6 +33,29 @@ def _raw_subprocess_pipe_decode_worker(
     process: subprocess.Popen | None = None
     container: av.container.Container | None = None
     stderr_file = None
+    pending_video_payloads: list[dict[str, object]] = []
+    pending_audio_payloads: list[dict[str, object]] = []
+
+    def _flush_payload_batch(
+        target_queue,
+        pending_payloads: list[dict[str, object]],
+        drop_count: int,
+        batch_size: int,
+        force: bool = False,
+    ) -> None:
+        if not pending_payloads:
+            return
+        if not force and len(pending_payloads) < batch_size:
+            return
+        payload_batch = pending_payloads.copy()
+        pending_payloads.clear()
+        outbound_payload: object
+        if len(payload_batch) == 1:
+            outbound_payload = payload_batch[0]
+        else:
+            outbound_payload = payload_batch
+        _put_with_drop(target_queue, outbound_payload, drop_count)
+
     try:
         if stderr_log_path is not None:
             stderr_file = open(stderr_log_path, "a")
@@ -76,27 +101,54 @@ def _raw_subprocess_pipe_decode_worker(
         streams_to_decode = [
             s for s in [video_stream, audio_stream] if s is not None
         ]
+        should_reformat = width is not None and height is not None
 
         for frame in container.decode(*streams_to_decode):
             if stop_event.is_set():
                 break
 
             if isinstance(frame, av.VideoFrame):
-                if width is not None and height is not None:
+                if should_reformat:
                     if frame.width != width or frame.height != height:
                         frame = frame.reformat(width=width, height=height)
                 if crop_ratio is not None:
                     frame = WrappedVideoFrame(frame).crop_center(crop_ratio).frame
                 payload = _serialize_video_frame(frame)
-                _put_with_drop(video_queue, payload, video_drop_count)
+                pending_video_payloads.append(payload)
+                _flush_payload_batch(
+                    video_queue,
+                    pending_video_payloads,
+                    video_drop_count,
+                    _VIDEO_PAYLOAD_BATCH_SIZE,
+                )
 
             elif isinstance(frame, av.AudioFrame):
                 payload = _serialize_audio_frame(frame)
-                _put_with_drop(audio_queue, payload, audio_drop_count)
+                pending_audio_payloads.append(payload)
+                _flush_payload_batch(
+                    audio_queue,
+                    pending_audio_payloads,
+                    audio_drop_count,
+                    _AUDIO_PAYLOAD_BATCH_SIZE,
+                )
 
     except Exception as e:
         print(f"フレーム読み込みエラー: {str(e)}")
     finally:
+        _flush_payload_batch(
+            video_queue,
+            pending_video_payloads,
+            video_drop_count,
+            _VIDEO_PAYLOAD_BATCH_SIZE,
+            force=True,
+        )
+        _flush_payload_batch(
+            audio_queue,
+            pending_audio_payloads,
+            audio_drop_count,
+            _AUDIO_PAYLOAD_BATCH_SIZE,
+            force=True,
+        )
         if container:
             try:
                 container.close()
