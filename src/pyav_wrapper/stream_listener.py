@@ -647,7 +647,7 @@ class StreamListener:
             had_data |= self._drain_audio_queue()
 
             if not had_data:
-                time.sleep(0.1)
+                time.sleep(1/60)
 
             if not self.is_running:
                 break

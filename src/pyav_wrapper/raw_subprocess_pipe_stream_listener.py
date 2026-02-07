@@ -12,7 +12,7 @@ from pyav_wrapper.stream_listener import (
 from pyav_wrapper.video_frame import WrappedVideoFrame
 
 DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_listener.log"
-_VIDEO_PAYLOAD_BATCH_SIZE = 4
+_VIDEO_PAYLOAD_BATCH_SIZE = 1
 _AUDIO_PAYLOAD_BATCH_SIZE = 16
 
 
