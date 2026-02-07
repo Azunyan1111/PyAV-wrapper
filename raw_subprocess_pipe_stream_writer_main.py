@@ -73,7 +73,7 @@ def main() -> None:
     t = time.time()
 
 
-    for i in range(30*60):  # 1分間実行
+    for i in range(45*240):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
@@ -84,21 +84,20 @@ def main() -> None:
             print(f"First frame: {first_frame.frame.pts}")
             print(f"Sent frames in {time.time() - t:.4f} seconds.")
             t = time.time()
-            print(f"Send Video Frame size: {len(video_frames)}")
         # ここで一秒間GILに激しい処理を入れる
         # start = time.perf_counter()
         # while time.perf_counter() - start < 1.0:
         #     pass
         # 90 %の時間GILを握り、10%の時間GILを解放する
-        end = time.perf_counter() + 1.0
-        while time.perf_counter() < end:
-            # 約10ms GILを握る
-            start = time.perf_counter()
-            while time.perf_counter() - start < 0.01:
-                pass
-            # 約1msだけGILを解放
-            time.sleep(1/1000)
-        # time.sleep(1/30)
+        # end = time.perf_counter() + 1.0
+        # while time.perf_counter() < end:
+        #     # 約10ms GILを握る
+        #     start = time.perf_counter()
+        #     while time.perf_counter() - start < 0.01:
+        #         pass
+        #     # 約1msだけGILを解放
+        #     time.sleep(1/1000)
+        time.sleep(1/240)
 
     # 6. 終了
     writer.stop()
