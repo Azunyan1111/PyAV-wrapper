@@ -48,26 +48,26 @@ def main() -> None:
 
     # 2. WHIP送信開始
     print(f"Starting WHIP writer to {WHIP_URL}...")
-    writer = RawSubprocessPipeStreamWriter(
-        command=[WHIP_CLIENT, WHIP_URL],
-        width=1280,
-        height=720,
-        fps=30,
-        stats_enabled=True,
-    )
+    # writer = RawSubprocessPipeStreamWriter(
+    #     command=[WHIP_CLIENT, WHIP_URL],
+    #     width=1280,
+    #     height=720,
+    #     fps=30,
+    #     stats_enabled=True,
+    # )
     print("WHIP writer started.")
 
     # 音声は非同期で即座に送信する
-    def audio_sending_loop() -> None:
-        while True:
-            audio_frames = listener.pop_all_audio_queue()
-            for af in audio_frames:
-                writer.enqueue_audio_frame(af)
-            time.sleep(1)
-            if len(audio_frames) > 0:
-                print(f"First audio frame: {audio_frames[0].frame.pts}")
-    audio_thread = threading.Thread(target=audio_sending_loop, daemon=True)
-    audio_thread.start()
+    # def audio_sending_loop() -> None:
+    #     while True:
+    #         audio_frames = listener.pop_all_audio_queue()
+    #         for af in audio_frames:
+    #             writer.enqueue_audio_frame(af)
+    #         time.sleep(1)
+    #         if len(audio_frames) > 0:
+    #             print(f"First audio frame: {audio_frames[0].frame.pts}")
+    # audio_thread = threading.Thread(target=audio_sending_loop, daemon=True)
+    # audio_thread.start()
 
     # 4. 継続的に中継（300秒間）
     t = time.time()
@@ -77,11 +77,12 @@ def main() -> None:
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
-            writer.enqueue_video_frame(vf)
+            pass
+            # writer.enqueue_video_frame(vf)
         if len(video_frames) > 0:
             # 両方の一番最初のフレームのタイムスタンプを表示
             first_frame = video_frames[0]
-            print(f"First frame: {first_frame.frame.pts}")
+            print(f"First frame pts: {first_frame.frame.pts}")
             print(f"Sent frames in {time.time() - t:.4f} seconds.")
             t = time.time()
         # ここで一秒間GILに激しい処理を入れる
@@ -100,7 +101,7 @@ def main() -> None:
         time.sleep(1/240)
 
     # 6. 終了
-    writer.stop()
+    # writer.stop()
     listener.stop()
 
 
