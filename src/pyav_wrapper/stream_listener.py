@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import fractions
 import multiprocessing
+import os
 import pickle
 import queue
 import threading
@@ -415,6 +416,16 @@ class StreamListener:
         self._crop_ratio = ratio
         if self.is_running:
             self._request_restart()
+
+    def set_batch_size(self, batch_size: int) -> None:
+        """映像フレームの取り出しバッチサイズを設定する
+
+        Args:
+            batch_size: 一度に取り出すフレーム数（1以上の整数）
+        """
+        if batch_size < 1:
+            raise ValueError(f"batch_sizeは1以上である必要があります: {batch_size}")
+        self.batch_size = batch_size
 
     def _stop_read_process(self) -> None:
         if self._stop_event is not None:
