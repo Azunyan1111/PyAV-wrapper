@@ -330,6 +330,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             audio_layout: str = "stereo",
             stats_enabled: bool = False,
             stderr_log_path: str | None = None,
+            crop_ratio: float | None = None,
     ):
         """
         Args:
@@ -342,6 +343,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             stats_enabled: FPS統計出力を有効にするかどうか
             stderr_log_path: サブプロセスのstderr出力先ファイルパス
                             Noneの場合は出力しない
+            crop_ratio: 送信時に適用するクロップ比率（0.0〜1.0）
         """
         self._command = command
         self._process: subprocess.Popen | None = None
@@ -362,6 +364,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             sample_rate=sample_rate,
             audio_layout=audio_layout,
             stats_enabled=stats_enabled,
+            crop_ratio=crop_ratio,
         )
 
     def set_stderr_log_path(self, path: str | None) -> None:

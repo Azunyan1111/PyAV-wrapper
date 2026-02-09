@@ -629,6 +629,7 @@ class StreamWriter:
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
         stats_enabled: bool = False,
+        crop_ratio: float | None = None,
     ) -> None:
         """
         Args:
@@ -639,9 +640,12 @@ class StreamWriter:
             sample_rate: 音声サンプルレート（デフォルト: 48000）
             audio_layout: 音声チャンネルレイアウト（デフォルト: "stereo"）
             stats_enabled: FPS統計出力を有効にするかどうか
+            crop_ratio: 送信時に適用するクロップ比率（0.0〜1.0）
         """
         if width is None or height is None:
             raise ValueError("widthとheightは必須です")
+        if crop_ratio is not None and not (0.0 < crop_ratio <= 1.0):
+            raise ValueError(f"crop_ratio must be between 0.0 and 1.0, got {crop_ratio}")
         self.url = url
         self.width = width
         self.height = height
@@ -690,7 +694,7 @@ class StreamWriter:
         self._stats_enabled = stats_enabled
 
         # Crop設定
-        self._crop_ratio: float | None = None
+        self._crop_ratio: float | None = crop_ratio
         self._stats_video_frame_count: int = 0
         self._stats_audio_frame_count: int = 0
         self._stats_last_time: float = time.monotonic()
@@ -790,16 +794,6 @@ class StreamWriter:
             self._control_queue.put_nowait({"cmd": "close_container"})
         except Exception:
             pass
-
-    def set_crop_ratio(self, ratio: float | None) -> None:
-        """クロップ比率を設定
-
-        Args:
-            ratio: クロップ比率（0.0〜1.0）。Noneの場合はクロップしない。
-        """
-        if ratio is not None and not (0.0 < ratio <= 1.0):
-            raise ValueError(f"ratio must be between 0.0 and 1.0, got {ratio}")
-        self._crop_ratio = ratio
 
     def enqueue_video_frame(self, frame: WrappedVideoFrame) -> None:
         """映像フレームをキューに追加（ノンブロッキング）

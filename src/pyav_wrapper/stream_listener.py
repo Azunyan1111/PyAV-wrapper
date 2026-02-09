@@ -403,20 +403,6 @@ class StreamListener:
         )
         self._read_thread.start()
 
-    def set_crop_ratio(self, ratio: float | None) -> None:
-        """受信時に適用するクロップ比率を設定
-
-        Args:
-            ratio: クロップ比率（0.0〜1.0）。Noneの場合はクロップしない。
-        """
-        if ratio is not None and not (0.0 < ratio <= 1.0):
-            raise ValueError(f"ratio must be between 0.0 and 1.0, got {ratio}")
-        if ratio == self._crop_ratio:
-            return
-        self._crop_ratio = ratio
-        if self.is_running:
-            self._request_restart()
-
     def set_batch_size(self, batch_size: int) -> None:
         """映像フレームの取り出しバッチサイズを設定する
 
