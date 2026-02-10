@@ -184,6 +184,7 @@ def _put_with_drop(
         target_queue.put_nowait(item)
         return
     except queue.Full:
+        print(f"[Listener] mp queue full, dropping {drop_count} frames")
         for _ in range(drop_count):
             try:
                 dropped = target_queue.get_nowait()
@@ -193,6 +194,7 @@ def _put_with_drop(
         try:
             target_queue.put_nowait(item)
         except queue.Full:
+            print("[Listener] mp queue still full after drop, discarding new frame")
             _cleanup_payload_shared_memory(item)
             return
     except (ValueError, OSError):
@@ -746,7 +748,9 @@ class StreamListener:
         with self.video_queue_lock:
             try:
                 if len(self.video_queue) >= self.video_queue.maxlen:
-                    for _ in range(max(1, len(self.video_queue) // 10)):
+                    drop_count = max(1, len(self.video_queue) // 10)
+                    print(f"[Listener] video queue full ({len(self.video_queue)}/{self.video_queue.maxlen}), dropping {drop_count} frames")
+                    for _ in range(drop_count):
                         self.video_queue.pop()
                 self.video_queue.append(frame)
             except Exception as e:
@@ -776,6 +780,11 @@ class StreamListener:
         with self.audio_queue_lock:
             try:
                 samples = self._get_audio_frame_samples(frame)
+                if (
+                    self._audio_queue_samples + samples > self._audio_queue_max_samples
+                    and self.audio_queue
+                ):
+                    print(f"[Listener] audio queue full ({self._audio_queue_samples}/{self._audio_queue_max_samples} samples), dropping old frames")
                 while (
                     self._audio_queue_samples + samples > self._audio_queue_max_samples
                     and self.audio_queue
