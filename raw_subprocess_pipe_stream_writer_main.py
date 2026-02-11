@@ -33,7 +33,8 @@ if _missing_keys:
 WHEP_CLIENT = _env["WHEP_CLIENT"]
 WHIP_CLIENT = _env["WHIP_CLIENT"]
 WHEP_URL = _env["WHEP_URL"]
-WHIP_URL = _env["WHIP_URL"]
+# WHIP_URL = _env["WHIP_URL"]
+WHIP_URL = f"http://localhost:8889/{int(time.time() * 1000)}/whip"
 
 
 def main() -> None:
@@ -43,6 +44,7 @@ def main() -> None:
         command=[WHEP_CLIENT, WHEP_URL],
         width=1600,
         height=900,
+        fps=5,
     )
     print("WHEP listener started.")
 
@@ -74,18 +76,18 @@ def main() -> None:
     # 4. 継続的に中継（300秒間）
     t = time.time()
 
-    for i in range(30 * 240):  # 1分間実行
+    for i in range(15 * 240):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
             # pass
             writer.enqueue_video_frame(vf)
-        if len(video_frames) > 0:
-            # 両方の一番最初のフレームのタイムスタンプを表示
-            first_frame = video_frames[0]
-            print(f"First frame pts: {first_frame.frame.pts}")
-            print(f"Sent frames in {time.time() - t:.4f} seconds.")
-            t = time.time()
+        # if len(video_frames) > 0:
+        #     # 両方の一番最初のフレームのタイムスタンプを表示
+        #     first_frame = video_frames[0]
+        #     print(f"First frame pts: {first_frame.frame.pts}")
+        #     print(f"Sent frames in {time.time() - t:.4f} seconds.")
+        #     t = time.time()
         # ここで一秒間GILに激しい処理を入れる
         # start = time.perf_counter()
         # while time.perf_counter() - start < 1.0:

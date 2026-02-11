@@ -135,6 +135,7 @@ def _serialize_video_frame(
             "format": frame.frame.format.name,
             "width": frame.frame.width,
             "height": frame.frame.height,
+            "create_time": frame.create_time,
             "planes": planes,
             "plane_spans": plane_spans,
             "storage": storage,
@@ -274,6 +275,9 @@ def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
                     frame.planes[i].update(plane_data)
                 except Exception:
                     continue
+    create_time = payload.get("create_time")
+    if isinstance(create_time, (int, float)):
+        wrapped.set_create_time(create_time)
     wrapped.is_bad_frame = payload.get("is_bad_frame", False)
     return wrapped
 

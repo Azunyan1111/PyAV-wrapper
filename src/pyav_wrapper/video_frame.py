@@ -1,3 +1,5 @@
+import time
+
 import av
 import numpy as np
 from typing import Any
@@ -10,6 +12,7 @@ class WrappedVideoFrame:
         self._frame = frame
         self._is_bad_frame = False
         self._serialized_payload: dict[str, Any] | None = None
+        self._create_time: float = time.time()
 
     @property
     def frame(self) -> av.VideoFrame:
@@ -33,6 +36,15 @@ class WrappedVideoFrame:
     def get_serialized_payload(self) -> dict[str, Any] | None:
         """保持しているシリアライズ済みpayloadを取得する"""
         return self._serialized_payload
+
+    @property
+    def create_time(self) -> float:
+        """フレーム作成時刻を取得"""
+        return self._create_time
+
+    def set_create_time(self, value: float) -> None:
+        """フレーム作成時刻を設定"""
+        self._create_time = float(value)
 
     def get_buffer(self) -> np.ndarray:
         """フレーム全体のバッファをnumpy配列として取得
@@ -159,5 +171,6 @@ class WrappedVideoFrame:
         # 新しいフレームにplaneデータを書き込む
         wrapped_new = WrappedVideoFrame(new_frame)
         wrapped_new.set_planes(new_planes)
+        wrapped_new.set_create_time(self._create_time)
 
         return wrapped_new

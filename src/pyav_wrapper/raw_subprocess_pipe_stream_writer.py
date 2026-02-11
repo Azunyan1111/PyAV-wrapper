@@ -233,6 +233,8 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 has_data = True
                 try:
                     for packet in video_stream.encode(wrapped_frame.frame):
+                        if wrapped_frame.frame.pts % 30 == 0:
+                            print(f"pipeline diff:{(time.time() - wrapped_frame.create_time) * 1000:.3f} ms")
                         container.mux(packet)
                     last_write_time = time.time()
                     stats_video_frame_count += 1
