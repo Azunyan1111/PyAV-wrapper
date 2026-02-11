@@ -35,6 +35,7 @@ WHIP_CLIENT = _env["WHIP_CLIENT"]
 WHEP_URL = _env["WHEP_URL"]
 WHIP_URL = _env["WHIP_URL"]
 
+
 def main() -> None:
     # 1. WHEP受信開始
     print(f"Starting WHEP listener for {WHEP_URL}...")
@@ -42,43 +43,43 @@ def main() -> None:
         command=[WHEP_CLIENT, WHEP_URL],
         width=1600,
         height=900,
-        crop_ratio=0.8,
     )
     print("WHEP listener started.")
 
     # 2. WHIP送信開始
     print(f"Starting WHIP writer to {WHIP_URL}...")
-    # writer = RawSubprocessPipeStreamWriter(
-    #     command=[WHIP_CLIENT, WHIP_URL],
-    #     width=1280,
-    #     height=720,
-    #     fps=30,
-    #     stats_enabled=True,
-    # )
+    writer = RawSubprocessPipeStreamWriter(
+        command=[WHIP_CLIENT, WHIP_URL],
+        width=1280,
+        height=720,
+        fps=30,
+        crop_ratio=0.8,
+        stats_enabled=True,
+    )
     print("WHIP writer started.")
 
     # 音声は非同期で即座に送信する
-    # def audio_sending_loop() -> None:
-    #     while True:
-    #         audio_frames = listener.pop_all_audio_queue()
-    #         for af in audio_frames:
-    #             writer.enqueue_audio_frame(af)
-    #         time.sleep(1)
-    #         if len(audio_frames) > 0:
-    #             print(f"First audio frame: {audio_frames[0].frame.pts}")
-    # audio_thread = threading.Thread(target=audio_sending_loop, daemon=True)
-    # audio_thread.start()
+    def audio_sending_loop() -> None:
+        while True:
+            audio_frames = listener.pop_all_audio_queue()
+            for af in audio_frames:
+                writer.enqueue_audio_frame(af)
+            time.sleep(1)
+            if len(audio_frames) > 0:
+                print(f"First audio frame: {audio_frames[0].frame.pts}")
+
+    audio_thread = threading.Thread(target=audio_sending_loop, daemon=True)
+    audio_thread.start()
 
     # 4. 継続的に中継（300秒間）
     t = time.time()
 
-
-    for i in range(15*240):  # 1分間実行
+    for i in range(30 * 240):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
         for vf in video_frames:
-            pass
-            # writer.enqueue_video_frame(vf)
+            # pass
+            writer.enqueue_video_frame(vf)
         if len(video_frames) > 0:
             # 両方の一番最初のフレームのタイムスタンプを表示
             first_frame = video_frames[0]
@@ -98,7 +99,7 @@ def main() -> None:
         #         pass
         #     # 約1msだけGILを解放
         #     time.sleep(1/1000)
-        time.sleep(1/240)
+        time.sleep(1 / 240)
 
     # 6. 終了
     # writer.stop()

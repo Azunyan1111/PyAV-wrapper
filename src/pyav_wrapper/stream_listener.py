@@ -211,7 +211,6 @@ def _stream_listener_decode_worker(
     audio_queue: multiprocessing.Queue,
     video_drop_count: int,
     audio_drop_count: int,
-    crop_ratio: float | None = None,
 ) -> None:
     container: av.Container | None = None
     try:
@@ -240,8 +239,6 @@ def _stream_listener_decode_worker(
                 if width is not None and height is not None:
                     if frame.width != width or frame.height != height:
                         frame = frame.reformat(width=width, height=height)
-                if crop_ratio is not None:
-                    frame = WrappedVideoFrame(frame).crop_center(crop_ratio).frame
                 payload = _serialize_video_frame(frame)
                 _put_with_drop(video_queue, payload, video_drop_count)
 
@@ -286,7 +283,6 @@ class StreamListener:
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
         stats_enabled: bool = False,
-        crop_ratio: float | None = None,
     ):
         """
         Args:
@@ -297,12 +293,9 @@ class StreamListener:
             sample_rate: 想定音声サンプルレート（保持用）
             audio_layout: 想定音声チャンネルレイアウト（保持用）
             stats_enabled: FPS統計出力を有効にするかどうか
-            crop_ratio: 受信時に適用するクロップ比率（0.0〜1.0）
         """
         if width is None or height is None:
             raise ValueError("widthとheightは必須です")
-        if crop_ratio is not None and not (0.0 < crop_ratio <= 1.0):
-            raise ValueError(f"crop_ratio must be between 0.0 and 1.0, got {crop_ratio}")
         self.url = url
         self.width = width
         self.height = height
@@ -360,7 +353,6 @@ class StreamListener:
         self._stats_video_frame_count: int = 0
         self._stats_audio_frame_count: int = 0
         self._stats_last_time: float = time.monotonic()
-        self._crop_ratio: float | None = crop_ratio
 
         self.start_processing()
 
@@ -404,7 +396,6 @@ class StreamListener:
                 self._audio_mp_queue,
                 self._video_drop_count,
                 self._audio_drop_count,
-                self._crop_ratio,
             ),
             daemon=True,
         )
