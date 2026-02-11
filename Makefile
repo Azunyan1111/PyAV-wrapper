@@ -1,4 +1,4 @@
-.PHONY: test test-srt test-stream test-output test-writer-stream test-whep docker-build docker-run
+.PHONY: test test-srt test-stream test-output test-writer-stream test-whep docker-build docker-run release
 
 test:
 	uv run pytest
@@ -20,6 +20,17 @@ test-whep:
 
 test-whip:
 	uv run pytest tests/test_raw_subprocess_pipe_stream_writer.py -v -s --timeout 120
+
+release:
+	$(eval CUR := $(shell grep '^version = ' pyproject.toml | sed 's/version = "//;s/"//'))
+	$(eval NEXT := $(shell echo $(CUR) | awk -F. '{print $$1"."$$2"."$$3+1}'))
+	sed -i '' 's/^version = ".*"/version = "$(NEXT)"/' pyproject.toml
+	git add pyproject.toml
+	git commit -m "update version to $(NEXT)"
+	git tag v$(NEXT)
+	git push origin main
+	git push origin v$(NEXT)
+	gh release create v$(NEXT) --generate-notes
 
 docker-build:
 	docker build -t pyav-wrapper -f Dockerfile .
