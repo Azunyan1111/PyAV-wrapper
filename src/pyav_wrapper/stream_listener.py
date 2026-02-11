@@ -847,7 +847,7 @@ class StreamListener:
                     f"再接続閾値が上限({self._restart_threshold_max}秒)に達しました。"
                     "プロセスを終了します。"
                 )
-                os._exit(0)
+                os._exit(1)
         try:
             self._restart_connection()
         finally:
