@@ -295,6 +295,45 @@ class TestStreamListenerReconnection:
             listener.stop()
             assert listener.is_running is False
 
+    def test_restart_connection_reinitializes_process_and_queues(self):
+        """_restart_connectionでプロセス・キュー・containerが再初期化される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.mp4"
+            create_test_video_file(test_file, duration_frames=900)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            listener._restart_threshold = 999.0
+            listener._restart_threshold_max = 9999.0
+            listener._restart_wait_seconds = 0.1
+            time.sleep(0.5)
+
+            old_stop_event = listener._stop_event
+            old_video_mp_queue = listener._video_mp_queue
+            old_audio_mp_queue = listener._audio_mp_queue
+            old_read_thread = listener._read_thread
+            old_container = listener.container
+
+            try:
+                listener._restart_connection()
+                time.sleep(0.5)
+
+                assert listener._stop_event is not None
+                assert listener._video_mp_queue is not None
+                assert listener._audio_mp_queue is not None
+                assert listener._read_thread is not None
+                assert listener._read_thread.is_alive()
+                assert listener.container is not None
+
+                assert listener._stop_event is not old_stop_event
+                assert listener._video_mp_queue is not old_video_mp_queue
+                assert listener._audio_mp_queue is not old_audio_mp_queue
+                assert listener._read_thread is not old_read_thread
+                assert listener.container is not old_container
+                assert listener._restart_requested is False
+                assert listener._last_successful_read_time > 0.0
+            finally:
+                listener.stop()
+
 
 @pytest.mark.srt
 class TestStreamListenerSRTIntegration:

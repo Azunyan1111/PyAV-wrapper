@@ -386,8 +386,13 @@ class StreamListener:
         self._audio_mp_queue = self._mp_ctx.Queue(maxsize=self._audio_mp_queue_maxlen)
 
     def _start_read_process(self) -> None:
-        if self._stop_event is None:
-            self._stop_event = self._mp_ctx.Event()
+        if (
+            self._stop_event is None
+            or self._stop_event.is_set()
+            or self._video_mp_queue is None
+            or self._audio_mp_queue is None
+        ):
+            self._setup_multiprocessing()
         self._read_thread = self._mp_ctx.Process(
             target=_stream_listener_decode_worker,
             args=(
@@ -418,7 +423,7 @@ class StreamListener:
     def _stop_read_process(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
-        if self._read_thread and self._read_thread.is_alive():
+        if self._read_thread is not None:
             self._read_thread.join(timeout=5.0)
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.terminate()
@@ -428,18 +433,19 @@ class StreamListener:
     def _close_mp_queues(self) -> None:
         if self._video_mp_queue is not None:
             try:
+                self._video_mp_queue.cancel_join_thread()
                 self._video_mp_queue.close()
-                self._video_mp_queue.join_thread()
             except Exception:
                 pass
         if self._audio_mp_queue is not None:
             try:
+                self._audio_mp_queue.cancel_join_thread()
                 self._audio_mp_queue.close()
-                self._audio_mp_queue.join_thread()
             except Exception:
                 pass
         self._video_mp_queue = None
         self._audio_mp_queue = None
+        self._stop_event = None
 
     def _deserialize_video_frame(self, payload: dict[str, Any]) -> WrappedVideoFrame:
         frame = av.VideoFrame(
@@ -651,11 +657,16 @@ class StreamListener:
             if not self.is_running:
                 break
 
-            if self._read_thread and not self._read_thread.is_alive():
-                self._force_restart()
-                continue
-
             elapsed = time.time() - self._last_successful_read_time
+            if self._read_thread and not self._read_thread.is_alive():
+                if elapsed > self._restart_threshold:
+                    print(
+                        f"読み込みプロセスが停止し、{elapsed:.1f}秒間フレーム更新なし。"
+                        "再接続を試みます"
+                    )
+                    self._force_restart()
+                    continue
+
             if elapsed > self._restart_threshold:
                 print(
                     f"フレーム更新が{elapsed:.1f}秒間停止。再接続を試みます "
@@ -683,6 +694,8 @@ class StreamListener:
         if self._video_mp_queue is None:
             return False
         drained = False
+        max_payloads = max(1, self._video_mp_queue_maxlen)
+        processed_payloads = 0
 
         def _iter_payloads(payload_obj: Any):
             if isinstance(payload_obj, dict):
@@ -693,13 +706,14 @@ class StreamListener:
                     if isinstance(payload, dict):
                         yield payload
 
-        while True:
+        while processed_payloads < max_payloads:
             try:
                 payload_obj = self._video_mp_queue.get_nowait()
             except queue.Empty:
                 break
             except (ValueError, OSError):
                 break
+            processed_payloads += 1
 
             for payload in _iter_payloads(payload_obj):
                 wrapped = self._deserialize_video_frame(payload)
@@ -715,6 +729,8 @@ class StreamListener:
         if self._audio_mp_queue is None:
             return False
         drained = False
+        max_payloads = max(1, self._audio_mp_queue_maxlen)
+        processed_payloads = 0
 
         def _iter_payloads(payload_obj: Any):
             if isinstance(payload_obj, dict):
@@ -725,13 +741,14 @@ class StreamListener:
                     if isinstance(payload, dict):
                         yield payload
 
-        while True:
+        while processed_payloads < max_payloads:
             try:
                 payload_obj = self._audio_mp_queue.get_nowait()
             except queue.Empty:
                 break
             except (ValueError, OSError):
                 break
+            processed_payloads += 1
 
             for payload in _iter_payloads(payload_obj):
                 wrapped = self._deserialize_audio_frame(payload)
@@ -877,21 +894,30 @@ class StreamListener:
         with self.frame_lock:
             self.current_frame = None
 
+    def _reset_for_restart(self) -> None:
+        self.container = None
+        self._stop_read_process()
+        self._close_mp_queues()
+        self._clear_local_queues()
+        self._restart_requested = False
+
     def _restart_connection(self) -> None:
         """ストリーム接続を再確立する。サブクラスでオーバーライド可能。"""
         if not self.is_running:
             return
 
-        self._stop_read_process()
-        self._close_mp_queues()
+        self._reset_for_restart()
         self._interruptible_sleep(self._restart_wait_seconds)
 
         if not self.is_running:
             return
 
-        self._clear_local_queues()
         self._setup_multiprocessing()
         self._start_read_process()
         self.container = _StreamListenerContainerProxy(self._request_restart)
+        self._restart_requested = False
         self._last_successful_read_time = time.time()
+        self._stats_video_frame_count = 0
+        self._stats_audio_frame_count = 0
+        self._stats_last_time = time.monotonic()
         print("再接続に成功しました")
