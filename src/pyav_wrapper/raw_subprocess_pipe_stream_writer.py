@@ -69,6 +69,8 @@ def _raw_subprocess_pipe_stream_writer_worker(
     pending_audio_count: int = 0
     last_write_time: float | None = None
     pending_video_payloads: collections.deque[dict[str, object]] = collections.deque()
+    pending_audio_payloads: collections.deque[dict[str, object]] = collections.deque()
+    audio_samples_target_per_cycle = max(1, int(round(sample_rate / max(1, fps))))
 
     def _notify_status(status: str, payload: dict[str, object] | None = None) -> None:
         if status_queue is None:
@@ -143,6 +145,19 @@ def _raw_subprocess_pipe_stream_writer_worker(
             for item in payload_obj:
                 if isinstance(item, dict):
                     yield item
+
+    def _get_audio_payload_nowait() -> dict[str, object] | None:
+        if pending_audio_payloads:
+            return pending_audio_payloads.popleft()
+        try:
+            payload_obj = audio_queue.get_nowait()
+        except queue.Empty:
+            return None
+        for payload in _iter_audio_payloads(payload_obj):
+            pending_audio_payloads.append(payload)
+        if pending_audio_payloads:
+            return pending_audio_payloads.popleft()
+        return None
 
     def _open_container():
         if process is None or process.stdin is None:
@@ -232,33 +247,39 @@ def _raw_subprocess_pipe_stream_writer_worker(
 
                 has_data = True
                 try:
+                    target = wrapped_frame.frame.pts is not None and wrapped_frame.frame.pts % 30 == 0
+                    create_time = wrapped_frame.create_time
+                    if target:
+                        print(f"pipeline diff no encode★:{(time.time() - create_time) * 1000:.3f} ms")
                     for packet in video_stream.encode(wrapped_frame.frame):
-                        if wrapped_frame.frame.pts % 30 == 0:
-                            print(f"pipeline diff:{(time.time() - wrapped_frame.create_time) * 1000:.3f} ms")
                         container.mux(packet)
+                    if target:
+                        print(f"pipeline diff is encode●:{(time.time() - create_time) * 1000:.3f} ms")
                     last_write_time = time.time()
                     stats_video_frame_count += 1
                     pending_video_count += 1
                 except Exception as e:
                     print(f"RawSubprocessPipeStreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
-            while True:
-                try:
-                    audio_payload_obj = audio_queue.get_nowait()
-                except queue.Empty:
+            drained_audio_samples = 0
+            while drained_audio_samples < audio_samples_target_per_cycle:
+                audio_payload = _get_audio_payload_nowait()
+                if audio_payload is None:
                     break
-
-                for audio_payload in _iter_audio_payloads(audio_payload_obj):
-                    wrapped_audio = _deserialize_audio_frame(audio_payload)
-                    has_data = True
-                    try:
-                        for packet in audio_stream.encode(wrapped_audio.frame):
-                            container.mux(packet)
-                        last_write_time = time.time()
-                        stats_audio_frame_count += 1
-                        pending_audio_count += 1
-                    except Exception as e:
-                        print(f"RawSubprocessPipeStreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                wrapped_audio = _deserialize_audio_frame(audio_payload)
+                has_data = True
+                frame_samples = wrapped_audio.frame.samples
+                if frame_samples is None or frame_samples <= 0:
+                    frame_samples = 1
+                try:
+                    for packet in audio_stream.encode(wrapped_audio.frame):
+                        container.mux(packet)
+                    last_write_time = time.time()
+                    stats_audio_frame_count += 1
+                    pending_audio_count += 1
+                except Exception as e:
+                    print(f"RawSubprocessPipeStreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                drained_audio_samples += frame_samples
 
             if not has_data:
                 time.sleep(0.001)
