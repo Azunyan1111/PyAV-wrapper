@@ -32,11 +32,13 @@ release:
 	git push origin v$(NEXT)
 	gh release create v$(NEXT) --generate-notes
 
+container-name := pyav-wrapper-$(shell echo $(notdir $(abspath ..)) | tr 'A-Z' 'a-z')
+
 docker-build:
-	docker build -t pyav-wrapper -f Dockerfile .
+	docker build -t $(container-name) -f Dockerfile .
 
 docker-run: docker-build
 	docker context use rtx4090
-	docker stop pyav-wrapper || true
-	docker rm pyav-wrapper || true
-	docker run --rm -t --gpus=all --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all --name pyav-wrapper pyav-wrapper
+	docker stop $(container-name) || true
+	docker rm $(container-name) || true
+	docker run --rm -t --gpus=all --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all --name $(container-name) $(container-name)
