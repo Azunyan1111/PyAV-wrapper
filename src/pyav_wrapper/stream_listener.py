@@ -759,7 +759,7 @@ class StreamListener:
                     drop_count = max(1, len(self.video_queue) // 10)
                     print(f"[Listener] video queue full ({len(self.video_queue)}/{self.video_queue.maxlen}), dropping {drop_count} frames")
                     for _ in range(drop_count):
-                        self.video_queue.pop()
+                        self.video_queue.popleft()
                 self.video_queue.append(frame)
             except Exception as e:
                 print(f"Videoキュー追加エラー: {repr(e)}")

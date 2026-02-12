@@ -116,6 +116,24 @@ class TestStreamListenerVideoQueue:
             assert len(listener.video_queue) <= max_size
             listener.stop()
 
+    def test_append_video_queue_discards_oldest_frame_when_full(self):
+        """Videoキュー満杯時は最も古いフレームを破棄する"""
+        listener = StreamListener.__new__(StreamListener)
+        listener.video_queue = collections.deque(maxlen=5)
+        listener.video_queue_lock = threading.Lock()
+
+        for pts in range(1, 6):
+            frame = av.VideoFrame(16, 16, "yuv420p")
+            frame.pts = pts
+            listener.append_video_queue(WrappedVideoFrame(frame))
+
+        newest_frame = av.VideoFrame(16, 16, "yuv420p")
+        newest_frame.pts = 6
+        listener.append_video_queue(WrappedVideoFrame(newest_frame))
+
+        pts_list = [wrapped.frame.pts for wrapped in listener.video_queue]
+        assert pts_list == [2, 3, 4, 5, 6]
+
 
 class TestStreamListenerAudioQueue:
     """StreamListener Audioキューのテスト"""
