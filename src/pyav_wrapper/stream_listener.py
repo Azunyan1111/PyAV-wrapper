@@ -767,6 +767,8 @@ class StreamListener:
     def pop_all_video_queue(self) -> list[WrappedVideoFrame]:
         """Videoキューからバッチサイズ分のフレームを取り出す"""
         with self.video_queue_lock:
+            if len(self.video_queue) > self.batch_size:
+                self.video_queue.popleft()
             if len(self.video_queue) < self.batch_size:
                 return []
             return_frames: list[WrappedVideoFrame] = []

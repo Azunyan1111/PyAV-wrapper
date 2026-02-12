@@ -103,6 +103,25 @@ class TestStreamListenerVideoQueue:
                 assert all(isinstance(f, WrappedVideoFrame) for f in frames)
             listener.stop()
 
+    def test_pop_all_video_queue_drops_one_oldest_frame_when_backlogged(self):
+        """Videoキュー滞留時は先頭を1フレーム捨ててからバッチ取得する"""
+        listener = StreamListener.__new__(StreamListener)
+        listener.video_queue = collections.deque(maxlen=10)
+        listener.video_queue_lock = threading.Lock()
+        listener.batch_size = 3
+
+        for pts in range(1, 8):
+            frame = av.VideoFrame(16, 16, "yuv420p")
+            frame.pts = pts
+            listener.video_queue.append(WrappedVideoFrame(frame))
+
+        frames = listener.pop_all_video_queue()
+        popped_pts = [wrapped.frame.pts for wrapped in frames]
+        remaining_pts = [wrapped.frame.pts for wrapped in listener.video_queue]
+
+        assert popped_pts == [2, 3, 4]
+        assert remaining_pts == [5, 6, 7]
+
     def test_video_queue_overflow_handling(self):
         """Videoキュー満杯時に古いフレームが破棄される"""
         with tempfile.TemporaryDirectory() as tmpdir:
