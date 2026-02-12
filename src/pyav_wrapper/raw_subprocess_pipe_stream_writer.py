@@ -247,10 +247,14 @@ def _raw_subprocess_pipe_stream_writer_worker(
 
                 has_data = True
                 try:
+                    target = wrapped_frame.frame.pts is not None and wrapped_frame.frame.pts % 30 == 0
+                    create_time = wrapped_frame.create_time
+                    if target:
+                        print(f"pipeline diff no encode★:{(time.time() - create_time) * 1000:.3f} ms")
                     for packet in video_stream.encode(wrapped_frame.frame):
-                        if wrapped_frame.frame.pts % 30 == 0:
-                            print(f"pipeline diff:{(time.time() - wrapped_frame.create_time) * 1000:.3f} ms")
                         container.mux(packet)
+                    if target:
+                        print(f"pipeline diff is encode●:{(time.time() - create_time) * 1000:.3f} ms")
                     last_write_time = time.time()
                     stats_video_frame_count += 1
                     pending_video_count += 1
