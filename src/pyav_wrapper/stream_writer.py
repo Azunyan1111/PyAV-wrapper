@@ -651,6 +651,7 @@ class StreamWriter:
         audio_layout: str = "stereo",
         stats_enabled: bool = False,
         crop_ratio: float | None = None,
+        video_queue_maxlen: int | None = None,
     ) -> None:
         """
         Args:
@@ -662,11 +663,17 @@ class StreamWriter:
             audio_layout: 音声チャンネルレイアウト（デフォルト: "stereo"）
             stats_enabled: FPS統計出力を有効にするかどうか
             crop_ratio: 送信時に適用するクロップ比率（0.0〜1.0）
+            video_queue_maxlen: 映像キュー容量。未指定時はfps*1.7
         """
         if width is None or height is None:
             raise ValueError("widthとheightは必須です")
         if crop_ratio is not None and not (0.0 < crop_ratio <= 1.0):
             raise ValueError(f"crop_ratio must be between 0.0 and 1.0, got {crop_ratio}")
+        if video_queue_maxlen is not None and int(video_queue_maxlen) <= 0:
+            raise ValueError(
+                "video_queue_maxlen must be greater than 0 when specified, "
+                f"got {video_queue_maxlen}"
+            )
         self.url = url
         self.width = width
         self.height = height
@@ -674,8 +681,11 @@ class StreamWriter:
         self.sample_rate = sample_rate
         self.audio_layout = audio_layout
 
-        # キューの初期化（FPSの1.7倍のキャパシティ）
-        self._video_queue_maxlen = int(self.fps * 1.7)
+        # キューの初期化（映像は明示指定を優先、未指定時は従来どおりfps連動）
+        if video_queue_maxlen is not None:
+            self._video_queue_maxlen = int(video_queue_maxlen)
+        else:
+            self._video_queue_maxlen = int(self.fps * 1.7)
         self._audio_queue_maxlen = int(self.sample_rate * 1.7)
         self.video_queue: queue.Queue[WrappedVideoFrame] = queue.Queue(
             maxsize=self._video_queue_maxlen

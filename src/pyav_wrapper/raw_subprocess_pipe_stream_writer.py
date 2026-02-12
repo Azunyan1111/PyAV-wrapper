@@ -377,6 +377,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             prefer_latest_video_payload: bool = False,
             video_priority_lag_threshold_ms: float = 120.0,
             crop_ratio: float | None = None,
+            video_queue_maxlen: int | None = None,
     ):
         """
         Args:
@@ -392,6 +393,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             prefer_latest_video_payload: Trueで古い映像payloadを捨て最新フレームを優先する
             video_priority_lag_threshold_ms: 映像遅延がこの閾値(ms)以上のとき音声処理を後回しにする
             crop_ratio: 送信時に適用するクロップ比率（0.0〜1.0）
+            video_queue_maxlen: 映像キュー容量。未指定時はfps*1.7
         """
         self._command = command
         self._process: subprocess.Popen | None = None
@@ -415,6 +417,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             audio_layout=audio_layout,
             stats_enabled=stats_enabled,
             crop_ratio=crop_ratio,
+            video_queue_maxlen=video_queue_maxlen,
         )
 
     def set_stderr_log_path(self, path: str | None) -> None:

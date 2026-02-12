@@ -57,12 +57,13 @@ def main() -> None:
         prefer_latest_video_payload=True,
         crop_ratio=0.8,
         stats_enabled=True,
+        video_queue_maxlen=int(5*1.7),
     )
     print("WHIP writer started.")
 
     # 映像は受信payloadをそのままwriterへ直送する（デシリアライズ不要）
-    listener.forward_video_to_writer(writer, forward_only=True)
-    print("Video direct forwarding enabled.")
+    # listener.forward_video_to_writer(writer, forward_only=True)
+    # print("Video direct forwarding enabled.")
 
     # 音声は受信payloadをそのままwriterへ直送する（デシリアライズ不要）
     listener.forward_audio_to_writer(writer, forward_only=True)
@@ -70,6 +71,9 @@ def main() -> None:
 
     # 4. 継続的に中継（300秒間）
     for i in range(15 * 240):  # 1分間実行
+        frames = listener.pop_all_video_queue()
+        if len(frames) != 0:
+            writer.enqueue_video_frames(frames)
         # 直送モードでは待機のみ
         time.sleep(1 / 240)
 

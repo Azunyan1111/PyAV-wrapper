@@ -309,8 +309,8 @@ class StreamListener:
         self.batch_size = batch_size
         video_queue_maxlen = int(self.batch_size * 1.7)
         # 高解像度時はキュー上限を抑え、メモリ増大によるプロセス終了を防ぐ
-        if self.width * self.height >= 1280 * 720:
-            video_queue_maxlen = min(video_queue_maxlen, self.batch_size)
+        # if self.width * self.height >= 1280 * 720:
+        #     video_queue_maxlen = min(video_queue_maxlen, self.batch_size)
         self.video_queue: collections.deque[WrappedVideoFrame] = collections.deque(
             maxlen=video_queue_maxlen
         )
