@@ -179,7 +179,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
         command: list[str],
         width: int,
         height: int,
-        fps: int = 30,
+        batch_size: int = 30,
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
         stderr_log_path: str | None = None,
@@ -189,7 +189,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
             command: 実行するコマンド（例: ["./deps/whep-client", "https://..."]）
             width: 出力幅（リサイズ用）
             height: 出力高さ（リサイズ用）
-            fps: 想定フレームレート（保持用）
+            batch_size: 取り出すバッチサイズ
             sample_rate: 想定音声サンプルレート（保持用）
             audio_layout: 想定音声チャンネルレイアウト（保持用）
             stderr_log_path: サブプロセスのstderr出力先ファイルパス
@@ -205,7 +205,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
             url="pipe:",
             width=width,
             height=height,
-            fps=fps,
+            batch_size=batch_size,
             sample_rate=sample_rate,
             audio_layout=audio_layout,
         )

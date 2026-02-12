@@ -279,7 +279,7 @@ class StreamListener:
         url: str,
         width: int,
         height: int,
-        fps: int = 30,
+        batch_size: int = 30,
         sample_rate: int = 48000,
         audio_layout: str = "stereo",
         stats_enabled: bool = False,
@@ -289,7 +289,7 @@ class StreamListener:
             url: 任意のストリームURL（srt://, rtmp://, udp://等）
             width: 出力幅（リサイズ用）
             height: 出力高さ（リサイズ用）
-            fps: 想定フレームレート（保持用）
+            batch_size: 想定フレームレート（保持用）
             sample_rate: 想定音声サンプルレート（保持用）
             audio_layout: 想定音声チャンネルレイアウト（保持用）
             stats_enabled: FPS統計出力を有効にするかどうか
@@ -299,7 +299,6 @@ class StreamListener:
         self.url = url
         self.width = width
         self.height = height
-        self.fps = fps
         self.sample_rate = sample_rate
         self.audio_layout = audio_layout
         self.is_running = False
@@ -307,7 +306,7 @@ class StreamListener:
         self._read_thread: multiprocessing.Process | None = None
 
         # Video
-        self.batch_size = fps
+        self.batch_size = batch_size
         video_queue_maxlen = int(self.batch_size * 1.7)
         # 高解像度時はキュー上限を抑え、メモリ増大によるプロセス終了を防ぐ
         if self.width * self.height >= 1280 * 720:
