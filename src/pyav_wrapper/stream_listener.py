@@ -317,6 +317,8 @@ class StreamListener:
         self.video_queue_lock = threading.Lock()
         self.frame_lock = threading.Lock()
         self.current_frame: WrappedVideoFrame | None = None
+        self._video_payload_forwarder: Callable[[dict[str, Any]], None] | None = None
+        self._video_forward_only = False
 
         # Audio
         self.batch_size_audio = self.sample_rate
@@ -437,6 +439,32 @@ class StreamListener:
         if not callable(enqueue_audio_payload):
             raise ValueError("writerはenqueue_audio_payload(payload)を実装している必要があります")
         self.set_audio_payload_forwarder(enqueue_audio_payload, forward_only=forward_only)
+
+    def set_video_payload_forwarder(
+        self,
+        forwarder: Callable[[dict[str, Any]], None] | None,
+        forward_only: bool = False,
+    ) -> None:
+        """映像payloadを受信時に直接転送するforwarderを設定する
+
+        Args:
+            forwarder: payload(dict)を受け取るコールバック。Noneで無効化。
+            forward_only: Trueの場合、転送成功時はローカルvideo_queueへ積まない。
+        """
+        self._video_payload_forwarder = forwarder
+        self._video_forward_only = bool(forwarder is not None and forward_only)
+
+    def forward_video_to_writer(self, writer: Any, forward_only: bool = True) -> None:
+        """writerのenqueue_video_payloadへ映像payloadを直接転送する
+
+        Args:
+            writer: enqueue_video_payload(payload)を実装するwriterインスタンス
+            forward_only: Trueの場合、転送成功時はローカルvideo_queueへ積まない。
+        """
+        enqueue_video_payload = getattr(writer, "enqueue_video_payload", None)
+        if not callable(enqueue_video_payload):
+            raise ValueError("writerはenqueue_video_payload(payload)を実装している必要があります")
+        self.set_video_payload_forwarder(enqueue_video_payload, forward_only=forward_only)
 
     def _stop_read_process(self) -> None:
         if self._stop_event is not None:
@@ -734,10 +762,20 @@ class StreamListener:
             processed_payloads += 1
 
             for payload in _iter_payloads(payload_obj):
-                wrapped = self._deserialize_video_frame(payload)
-                with self.frame_lock:
-                    self.current_frame = wrapped
-                self.append_video_queue(wrapped)
+                forwarded = False
+                forwarder = self._video_payload_forwarder
+                if forwarder is not None:
+                    try:
+                        forwarder(payload)
+                        forwarded = True
+                    except Exception as e:
+                        print(f"Video payload転送エラー: {repr(e)}")
+
+                if not (forwarded and self._video_forward_only):
+                    wrapped = self._deserialize_video_frame(payload)
+                    with self.frame_lock:
+                        self.current_frame = wrapped
+                    self.append_video_queue(wrapped)
                 self._last_successful_read_time = time.time()
                 self._stats_video_frame_count += 1
                 drained = True

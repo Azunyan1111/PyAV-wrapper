@@ -54,47 +54,27 @@ def main() -> None:
         width=1280,
         height=720,
         fps=30,
+        prefer_latest_video_payload=True,
         crop_ratio=0.8,
         stats_enabled=True,
     )
     print("WHIP writer started.")
+
+    # 映像は受信payloadをそのままwriterへ直送する（デシリアライズ不要）
+    listener.forward_video_to_writer(writer, forward_only=True)
+    print("Video direct forwarding enabled.")
 
     # 音声は受信payloadをそのままwriterへ直送する（デシリアライズ不要）
     listener.forward_audio_to_writer(writer, forward_only=True)
     print("Audio direct forwarding enabled.")
 
     # 4. 継続的に中継（300秒間）
-    t = time.time()
-
     for i in range(15 * 240):  # 1分間実行
-        # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
-        video_frames = listener.pop_all_video_queue()
-        for vf in video_frames:
-            # pass
-            writer.enqueue_video_frame(vf)
-        # if len(video_frames) > 0:
-        #     # 両方の一番最初のフレームのタイムスタンプを表示
-        #     first_frame = video_frames[0]
-        #     print(f"First frame pts: {first_frame.frame.pts}")
-        #     print(f"Sent frames in {time.time() - t:.4f} seconds.")
-        #     t = time.time()
-        # ここで一秒間GILに激しい処理を入れる
-        # start = time.perf_counter()
-        # while time.perf_counter() - start < 1.0:
-        #     pass
-        # 90 %の時間GILを握り、10%の時間GILを解放する
-        # end = time.perf_counter() + 1.0
-        # while time.perf_counter() < end:
-        #     # 約10ms GILを握る
-        #     start = time.perf_counter()
-        #     while time.perf_counter() - start < 0.01:
-        #         pass
-        #     # 約1msだけGILを解放
-        #     time.sleep(1/1000)
+        # 直送モードでは待機のみ
         time.sleep(1 / 240)
 
     # 6. 終了
-    # writer.stop()
+    writer.stop()
     listener.stop()
 
 

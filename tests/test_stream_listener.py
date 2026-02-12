@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from pyav_wrapper import StreamListener, WrappedAudioFrame, WrappedVideoFrame
-from pyav_wrapper.stream_listener import _serialize_audio_frame
+from pyav_wrapper.stream_listener import _serialize_audio_frame, _serialize_video_frame
 
 
 def create_test_video_file(path: Path, duration_frames: int = 60) -> None:
@@ -154,6 +154,59 @@ class TestStreamListenerVideoQueue:
 
         pts_list = [wrapped.frame.pts for wrapped in listener.video_queue]
         assert pts_list == [2, 3, 4, 5, 6]
+
+    def test_drain_video_queue_forward_only_skips_deserialize(self):
+        """forward_only=Trueではvideo payloadを直接転送し、デシリアライズしない"""
+        listener = StreamListener.__new__(StreamListener)
+        listener._video_mp_queue = queue.Queue()
+        listener._video_mp_queue_maxlen = 10
+        listener._last_successful_read_time = 0.0
+        listener._stats_video_frame_count = 0
+        listener._video_payload_forwarder = None
+        listener._video_forward_only = False
+
+        forwarded_payloads: list[dict[str, object]] = []
+        listener.set_video_payload_forwarder(forwarded_payloads.append, forward_only=True)
+
+        invalid_payload: dict[str, object] = {"invalid": "payload"}
+        listener._video_mp_queue.put(invalid_payload)
+
+        drained = listener._drain_video_queue()
+
+        assert drained is True
+        assert forwarded_payloads == [invalid_payload]
+        assert listener._stats_video_frame_count == 1
+
+    def test_drain_video_queue_forward_and_queue_when_forward_only_false(self):
+        """forward_only=Falseでは転送しつつローカルvideo_queueにも積む"""
+        listener = StreamListener.__new__(StreamListener)
+        listener._video_mp_queue = queue.Queue()
+        listener._video_mp_queue_maxlen = 10
+        listener._last_successful_read_time = 0.0
+        listener._stats_video_frame_count = 0
+        listener._video_payload_forwarder = None
+        listener._video_forward_only = False
+        listener.video_queue = collections.deque(maxlen=10)
+        listener.video_queue_lock = threading.Lock()
+        listener.frame_lock = threading.Lock()
+        listener.current_frame = None
+
+        forwarded_payloads: list[dict[str, object]] = []
+        listener.set_video_payload_forwarder(forwarded_payloads.append, forward_only=False)
+
+        frame = av.VideoFrame(16, 16, "yuv420p")
+        for plane in frame.planes:
+            plane.update(np.full(plane.buffer_size, 128, dtype=np.uint8))
+        frame.pts = 12
+        payload = _serialize_video_frame(frame)
+        listener._video_mp_queue.put(payload)
+
+        drained = listener._drain_video_queue()
+
+        assert drained is True
+        assert len(forwarded_payloads) == 1
+        assert len(listener.video_queue) == 1
+        assert isinstance(listener.video_queue[0], WrappedVideoFrame)
 
 
 class TestStreamListenerAudioQueue:

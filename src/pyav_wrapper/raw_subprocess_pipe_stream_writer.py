@@ -52,6 +52,8 @@ def _raw_subprocess_pipe_stream_writer_worker(
     status_queue: multiprocessing.Queue | None,
     control_queue: multiprocessing.Queue | None,
     stderr_log_path: str | None,
+    prefer_latest_video_payload: bool,
+    video_priority_lag_threshold_ms: float,
     crop_ratio: float | None = None,
 ) -> None:
     container: av.Container | None = None
@@ -232,6 +234,13 @@ def _raw_subprocess_pipe_stream_writer_worker(
             has_data = False
 
             video_payload = _get_video_payload(timeout=1 / 30)
+            if prefer_latest_video_payload and video_payload is not None:
+                while True:
+                    newer_video_payload = _get_video_payload(timeout=0.0)
+                    if newer_video_payload is None:
+                        break
+                    _cleanup_payload_shared_memory(video_payload)
+                    video_payload = newer_video_payload
 
             if video_payload is not None:
                 wrapped_frame = _deserialize_video_frame(video_payload)
@@ -246,12 +255,14 @@ def _raw_subprocess_pipe_stream_writer_worker(
                     wrapped_frame = wrapped_frame.crop_center(crop_ratio)
 
                 has_data = True
+                video_age_ms: float | None = None
                 try:
                     target = wrapped_frame.frame.pts is not None and wrapped_frame.frame.pts % 30 == 0
                     create_time = wrapped_frame.create_time
+                    video_age_ms = (time.time() - create_time) * 1000.0
                     pts = wrapped_frame.frame.pts
                     if target:
-                        print(f"pipeline diff no encode★:{(time.time() - create_time) * 1000:.3f} ms pts:{pts}")
+                        print(f"pipeline diff no encode★:{video_age_ms:.3f} ms pts:{pts}")
                     for packet in video_stream.encode(wrapped_frame.frame):
                         container.mux(packet)
                     if target:
@@ -261,6 +272,15 @@ def _raw_subprocess_pipe_stream_writer_worker(
                     pending_video_count += 1
                 except Exception as e:
                     print(f"RawSubprocessPipeStreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
+
+                # 遅延が閾値を超えている間は音声処理を後回しにし、映像追従を優先する
+                if (
+                    prefer_latest_video_payload
+                    and video_age_ms is not None
+                    and video_age_ms >= video_priority_lag_threshold_ms
+                ):
+                    _flush_status_if_needed()
+                    continue
 
             drained_audio_samples = 0
             while drained_audio_samples < audio_samples_target_per_cycle:
@@ -354,6 +374,8 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             audio_layout: str = "stereo",
             stats_enabled: bool = False,
             stderr_log_path: str | None = None,
+            prefer_latest_video_payload: bool = False,
+            video_priority_lag_threshold_ms: float = 120.0,
             crop_ratio: float | None = None,
     ):
         """
@@ -367,12 +389,16 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             stats_enabled: FPS統計出力を有効にするかどうか
             stderr_log_path: サブプロセスのstderr出力先ファイルパス
                             Noneの場合は出力しない
+            prefer_latest_video_payload: Trueで古い映像payloadを捨て最新フレームを優先する
+            video_priority_lag_threshold_ms: 映像遅延がこの閾値(ms)以上のとき音声処理を後回しにする
             crop_ratio: 送信時に適用するクロップ比率（0.0〜1.0）
         """
         self._command = command
         self._process: subprocess.Popen | None = None
         self._stderr_log_path = stderr_log_path
         self._stderr_file = None
+        self._prefer_latest_video_payload = prefer_latest_video_payload
+        self._video_priority_lag_threshold_ms = video_priority_lag_threshold_ms
         self._last_video_dimensions: tuple[int, int] | None = None
         self._pending_video_payloads: list[dict[str, object]] = []
         self._video_payload_lock = threading.Lock()
@@ -587,6 +613,8 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
                 self._status_queue,
                 self._control_queue,
                 self._stderr_log_path,
+                self._prefer_latest_video_payload,
+                self._video_priority_lag_threshold_ms,
                 self._crop_ratio,
             ),
             daemon=True,
