@@ -26,6 +26,8 @@ from pyav_wrapper.stream_writer import (
 from pyav_wrapper.video_frame import WrappedVideoFrame
 
 DEFAULT_STDERR_LOG_PATH = "/var/log/pyav_wrapper_writer.log"
+_PIPELINE_DIFF_LOG_INTERVAL = 30
+_MAX_AUDIO_PAYLOADS_PER_LOOP = 16
 
 
 def _open_worker_stderr(stderr_log_path: str | None):
@@ -68,6 +70,7 @@ def _raw_subprocess_pipe_stream_writer_worker(
     pending_video_count: int = 0
     pending_audio_count: int = 0
     last_write_time: float | None = None
+    pipeline_video_frame_count: int = 0
     pending_video_payloads: collections.deque[dict[str, object]] = collections.deque()
 
     def _notify_status(status: str, payload: dict[str, object] | None = None) -> None:
@@ -233,8 +236,12 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 has_data = True
                 try:
                     for packet in video_stream.encode(wrapped_frame.frame):
-                        if wrapped_frame.frame.pts % 30 == 0:
-                            print(f"pipeline diff:{(time.time() - wrapped_frame.create_time) * 1000:.3f} ms")
+                        pipeline_video_frame_count += 1
+                        if pipeline_video_frame_count % _PIPELINE_DIFF_LOG_INTERVAL == 0:
+                            print(
+                                f"pipeline diff:{(time.time() - wrapped_frame.create_time) * 1000:.3f} ms",
+                                flush=True,
+                            )
                         container.mux(packet)
                     last_write_time = time.time()
                     stats_video_frame_count += 1
@@ -242,7 +249,8 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 except Exception as e:
                     print(f"RawSubprocessPipeStreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
-            while True:
+            audio_payloads_processed = 0
+            while audio_payloads_processed < _MAX_AUDIO_PAYLOADS_PER_LOOP:
                 try:
                     audio_payload_obj = audio_queue.get_nowait()
                 except queue.Empty:
@@ -257,8 +265,11 @@ def _raw_subprocess_pipe_stream_writer_worker(
                         last_write_time = time.time()
                         stats_audio_frame_count += 1
                         pending_audio_count += 1
+                        audio_payloads_processed += 1
                     except Exception as e:
                         print(f"RawSubprocessPipeStreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                    if audio_payloads_processed >= _MAX_AUDIO_PAYLOADS_PER_LOOP:
+                        break
 
             if not has_data:
                 time.sleep(0.001)
@@ -355,6 +366,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         self._pending_video_payloads: list[dict[str, object]] = []
         self._video_payload_lock = threading.Lock()
         self._video_payload_batch_size = 4
+        self._video_payload_max_age_seconds = 1.0 / 240.0
         self._pending_audio_payloads: list[dict[str, object]] = []
         self._audio_payload_lock = threading.Lock()
         self._audio_payload_batch_size = 16
@@ -466,9 +478,18 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
 
             with self._video_payload_lock:
                 self._pending_video_payloads.append(payload)
-                if len(self._pending_video_payloads) >= self._video_payload_batch_size:
-                    self._flush_pending_video_payloads_locked(force=True)
-                elif len(self._pending_video_payloads) == 1 and not self._worker_has_video_reference:
+                should_flush = len(self._pending_video_payloads) >= self._video_payload_batch_size
+                if not should_flush and len(self._pending_video_payloads) == 1 and not self._worker_has_video_reference:
+                    should_flush = True
+                if not should_flush and self._pending_video_payloads:
+                    oldest_create_time = self._pending_video_payloads[0].get("create_time")
+                    if not isinstance(oldest_create_time, (int, float)):
+                        should_flush = len(self._pending_video_payloads) == 1
+                    else:
+                        oldest_age = time.time() - float(oldest_create_time)
+                        if oldest_age >= self._video_payload_max_age_seconds:
+                            should_flush = True
+                if should_flush:
                     self._flush_pending_video_payloads_locked(force=True)
         except Exception as e:
             print(f"映像フレームをMPキューに追加中にエラー: {repr(e)}")

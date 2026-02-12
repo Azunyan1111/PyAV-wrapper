@@ -201,6 +201,7 @@ class RawSubprocessPipeStreamListener(StreamListener):
         self._start_retry_interval_seconds = 1.0
         self._start_error: str | None = None
         self._stderr_log_path = stderr_log_path
+        self._video_partial_flush_max_wait_seconds = 1.0 / 120.0
         super().__init__(
             url="pipe:",
             width=width,
@@ -251,3 +252,35 @@ class RawSubprocessPipeStreamListener(StreamListener):
         self._start_error = None
         self._process = None
         super()._restart_connection()
+
+    def pop_all_video_queue(self) -> list:
+        """低遅延向けに、古いフレームを待ちすぎないよう取り出す。
+
+        通常はbatch_size分が溜まるまで待つが、最古フレームの滞留時間が
+        一定値を超えた場合は、溜まっている分を返して遅延蓄積を抑える。
+        """
+        with self.video_queue_lock:
+            if len(self.video_queue) == 0:
+                return []
+            # 全部返す
+            return_frames = list(self.video_queue)
+            self.video_queue.clear()
+            return return_frames
+
+            # if len(self.video_queue) >= self.batch_size:
+            #     return_frames = []
+            #     for _ in range(self.batch_size):
+            #         return_frames.append(self.video_queue.popleft())
+            #     return return_frames
+            #
+            # oldest_frame = self.video_queue[0]
+            # oldest_create_time = getattr(oldest_frame, "create_time", None)
+            # if not isinstance(oldest_create_time, (int, float)):
+            #     return []
+            # frame_age = time.time() - float(oldest_create_time)
+            # if frame_age < self._video_partial_flush_max_wait_seconds:
+            #     return []
+            #
+            # return_frames = list(self.video_queue)
+            # self.video_queue.clear()
+            # return return_frames

@@ -79,6 +79,8 @@ def main() -> None:
     for i in range(15 * 240):  # 1分間実行
         # print(f"Sending frames...")  # 1秒ごとに溜まったフレームを両方書き込む
         video_frames = listener.pop_all_video_queue()
+        if video_frames is not []:
+            time.sleep(0.13115191459655762) # 仮想的な処理負荷
         for vf in video_frames:
             # pass
             writer.enqueue_video_frame(vf)
