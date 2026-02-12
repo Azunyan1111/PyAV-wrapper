@@ -249,12 +249,13 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 try:
                     target = wrapped_frame.frame.pts is not None and wrapped_frame.frame.pts % 30 == 0
                     create_time = wrapped_frame.create_time
+                    pts = wrapped_frame.frame.pts
                     if target:
-                        print(f"pipeline diff no encode★:{(time.time() - create_time) * 1000:.3f} ms")
+                        print(f"pipeline diff no encode★:{(time.time() - create_time) * 1000:.3f} ms pts:{pts}")
                     for packet in video_stream.encode(wrapped_frame.frame):
                         container.mux(packet)
                     if target:
-                        print(f"pipeline diff is encode●:{(time.time() - create_time) * 1000:.3f} ms")
+                        print(f"pipeline diff is encode●:{(time.time() - create_time) * 1000:.3f} ms pts:{pts}")
                     last_write_time = time.time()
                     stats_video_frame_count += 1
                     pending_video_count += 1
@@ -375,7 +376,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
         self._last_video_dimensions: tuple[int, int] | None = None
         self._pending_video_payloads: list[dict[str, object]] = []
         self._video_payload_lock = threading.Lock()
-        self._video_payload_batch_size = 4
+        self._video_payload_batch_size = 1
         self._pending_audio_payloads: list[dict[str, object]] = []
         self._audio_payload_lock = threading.Lock()
         self._audio_payload_batch_size = 16
@@ -464,6 +465,9 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             self._last_video_dimensions = (frame.frame.width, frame.frame.height)
         except Exception:
             pass
+
+        if frame.frame.pts is not None and frame.frame.pts % 30 == 0:
+            print(f"pipeline diff send queue▲:{(time.time() - frame.create_time) * 1000:.3f} ms. pts:{frame.frame.pts}")
 
         try:
             payload: dict[str, object]

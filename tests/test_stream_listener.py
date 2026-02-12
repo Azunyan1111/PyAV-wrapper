@@ -1,4 +1,5 @@
 import collections
+import queue
 import tempfile
 import threading
 import time
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 
 from pyav_wrapper import StreamListener, WrappedAudioFrame, WrappedVideoFrame
+from pyav_wrapper.stream_listener import _serialize_audio_frame
 
 
 def create_test_video_file(path: Path, duration_frames: int = 60) -> None:
@@ -195,6 +197,59 @@ class TestStreamListenerAudioQueue:
 
             assert listener._audio_queue_samples <= listener._audio_queue_max_samples
             listener.stop()
+
+    def test_drain_audio_queue_forward_only_skips_deserialize(self):
+        """forward_only=Trueではpayloadを直接転送し、デシリアライズしない"""
+        listener = StreamListener.__new__(StreamListener)
+        listener._audio_mp_queue = queue.Queue()
+        listener._audio_mp_queue_maxlen = 10
+        listener._last_successful_read_time = 0.0
+        listener._stats_audio_frame_count = 0
+        listener._audio_payload_forwarder = None
+        listener._audio_forward_only = False
+
+        forwarded_payloads: list[dict[str, object]] = []
+        listener.set_audio_payload_forwarder(forwarded_payloads.append, forward_only=True)
+
+        invalid_payload: dict[str, object] = {"invalid": "payload"}
+        listener._audio_mp_queue.put(invalid_payload)
+
+        drained = listener._drain_audio_queue()
+
+        assert drained is True
+        assert forwarded_payloads == [invalid_payload]
+        assert listener._stats_audio_frame_count == 1
+
+    def test_drain_audio_queue_forward_and_queue_when_forward_only_false(self):
+        """forward_only=Falseでは転送しつつローカルaudio_queueにも積む"""
+        listener = StreamListener.__new__(StreamListener)
+        listener._audio_mp_queue = queue.Queue()
+        listener._audio_mp_queue_maxlen = 10
+        listener._last_successful_read_time = 0.0
+        listener._stats_audio_frame_count = 0
+        listener._audio_payload_forwarder = None
+        listener._audio_forward_only = False
+        listener._audio_queue_samples = 0
+        listener._audio_queue_max_samples = 100000
+        listener.audio_queue = collections.deque()
+        listener.audio_queue_lock = threading.Lock()
+
+        forwarded_payloads: list[dict[str, object]] = []
+        listener.set_audio_payload_forwarder(forwarded_payloads.append, forward_only=False)
+
+        samples = 320
+        audio_data = np.zeros((2, samples), dtype=np.float32)
+        frame = av.AudioFrame.from_ndarray(audio_data, format="fltp", layout="stereo")
+        frame.sample_rate = 48000
+        payload = _serialize_audio_frame(frame)
+        listener._audio_mp_queue.put(payload)
+
+        drained = listener._drain_audio_queue()
+
+        assert drained is True
+        assert len(forwarded_payloads) == 1
+        assert len(listener.audio_queue) == 1
+        assert isinstance(listener.audio_queue[0], WrappedAudioFrame)
 
 
 class TestStreamListenerControl:

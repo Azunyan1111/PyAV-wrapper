@@ -1,7 +1,6 @@
 import os
 import time
 from pyav_wrapper import RawSubprocessPipeStreamListener, RawSubprocessPipeStreamWriter
-import threading
 
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.v2")
 
@@ -44,7 +43,7 @@ def main() -> None:
         command=[WHEP_CLIENT, WHEP_URL],
         width=1600,
         height=900,
-        fps=5,
+        batch_size=5,
     )
     print("WHEP listener started.")
 
@@ -60,18 +59,9 @@ def main() -> None:
     )
     print("WHIP writer started.")
 
-    # 音声は非同期で即座に送信する
-    def audio_sending_loop() -> None:
-        while True:
-            audio_frames = listener.pop_all_audio_queue()
-            for af in audio_frames:
-                writer.enqueue_audio_frame(af)
-            time.sleep(1)
-            if len(audio_frames) > 0:
-                print(f"First audio frame: {audio_frames[0].frame.pts}")
-
-    audio_thread = threading.Thread(target=audio_sending_loop, daemon=True)
-    audio_thread.start()
+    # 音声は受信payloadをそのままwriterへ直送する（デシリアライズ不要）
+    listener.forward_audio_to_writer(writer, forward_only=True)
+    print("Audio direct forwarding enabled.")
 
     # 4. 継続的に中継（300秒間）
     t = time.time()

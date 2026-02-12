@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 from multiprocessing import shared_memory
-from typing import Any
+from typing import Any, Callable
 
 import av
 import numpy as np
@@ -325,6 +325,8 @@ class StreamListener:
         self._audio_queue_samples = 0
         self.audio_queue: collections.deque[WrappedAudioFrame] = collections.deque()
         self.audio_queue_lock = threading.Lock()
+        self._audio_payload_forwarder: Callable[[dict[str, Any]], None] | None = None
+        self._audio_forward_only = False
 
         # multiprocessing
         self._mp_ctx = multiprocessing.get_context()
@@ -409,6 +411,32 @@ class StreamListener:
         if batch_size < 1:
             raise ValueError(f"batch_sizeは1以上である必要があります: {batch_size}")
         self.batch_size = batch_size
+
+    def set_audio_payload_forwarder(
+        self,
+        forwarder: Callable[[dict[str, Any]], None] | None,
+        forward_only: bool = False,
+    ) -> None:
+        """音声payloadを受信時に直接転送するforwarderを設定する
+
+        Args:
+            forwarder: payload(dict)を受け取るコールバック。Noneで無効化。
+            forward_only: Trueの場合、転送成功時はローカルaudio_queueへ積まない。
+        """
+        self._audio_payload_forwarder = forwarder
+        self._audio_forward_only = bool(forwarder is not None and forward_only)
+
+    def forward_audio_to_writer(self, writer: Any, forward_only: bool = True) -> None:
+        """writerのenqueue_audio_payloadへ音声payloadを直接転送する
+
+        Args:
+            writer: enqueue_audio_payload(payload)を実装するwriterインスタンス
+            forward_only: Trueの場合、転送成功時はローカルaudio_queueへ積まない。
+        """
+        enqueue_audio_payload = getattr(writer, "enqueue_audio_payload", None)
+        if not callable(enqueue_audio_payload):
+            raise ValueError("writerはenqueue_audio_payload(payload)を実装している必要があります")
+        self.set_audio_payload_forwarder(enqueue_audio_payload, forward_only=forward_only)
 
     def _stop_read_process(self) -> None:
         if self._stop_event is not None:
@@ -741,8 +769,18 @@ class StreamListener:
             processed_payloads += 1
 
             for payload in _iter_payloads(payload_obj):
-                wrapped = self._deserialize_audio_frame(payload)
-                self.append_audio_queue(wrapped)
+                forwarded = False
+                forwarder = self._audio_payload_forwarder
+                if forwarder is not None:
+                    try:
+                        forwarder(payload)
+                        forwarded = True
+                    except Exception as e:
+                        print(f"Audio payload転送エラー: {repr(e)}")
+
+                if not (forwarded and self._audio_forward_only):
+                    wrapped = self._deserialize_audio_frame(payload)
+                    self.append_audio_queue(wrapped)
                 self._last_successful_read_time = time.time()
                 self._stats_audio_frame_count += 1
                 drained = True
@@ -772,7 +810,10 @@ class StreamListener:
                 return []
             return_frames: list[WrappedVideoFrame] = []
             for _ in range(self.batch_size):
-                return_frames.append(self.video_queue.popleft())
+                video_frame = self.video_queue.popleft()
+                if video_frame.frame.pts is not None and video_frame.frame.pts % 30 == 0:
+                    print(f"pipeline diff pop■:{(time.time() - video_frame.create_time) * 1000:.3f} ms. pts:{video_frame.frame.pts}")
+                return_frames.append(video_frame)
             return return_frames
 
     def _get_audio_frame_samples(self, frame: WrappedAudioFrame) -> int:

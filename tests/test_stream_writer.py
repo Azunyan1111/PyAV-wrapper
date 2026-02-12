@@ -15,6 +15,8 @@ from pyav_wrapper import (
     WrappedAudioFrame,
     WrappedVideoFrame,
 )
+from pyav_wrapper.stream_listener import _serialize_audio_frame as _serialize_listener_audio_frame
+from pyav_wrapper.stream_writer import _deserialize_audio_frame as _deserialize_writer_audio_frame
 
 
 def create_test_video_frame(width: int = 1280, height: int = 720) -> WrappedVideoFrame:
@@ -131,6 +133,21 @@ class TestStreamWriterAudioQueue:
             writer.enqueue_audio_frames(frames)
 
             writer.stop()
+
+    def test_deserialize_audio_frame_accepts_listener_payload(self):
+        """listener形式payload(planes)をwriterで復元できる"""
+        samples = 320
+        audio_data = np.zeros((2, samples), dtype=np.float32)
+        source_frame = av.AudioFrame.from_ndarray(audio_data, format="fltp", layout="stereo")
+        source_frame.sample_rate = 48000
+        source_frame.pts = 12345
+
+        payload = _serialize_listener_audio_frame(source_frame)
+        wrapped = _deserialize_writer_audio_frame(payload)
+
+        assert wrapped.frame.samples == samples
+        assert wrapped.frame.sample_rate == 48000
+        assert wrapped.frame.pts == 12345
 
 
 class TestStreamWriterControl:

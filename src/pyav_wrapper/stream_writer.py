@@ -283,6 +283,22 @@ def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
 
 
 def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
+    planes = payload.get("planes")
+    if isinstance(planes, list):
+        frame = av.AudioFrame(
+            format=payload["format"],
+            layout=payload["layout"],
+            samples=payload["samples"],
+        )
+        for i, plane_data in enumerate(planes):
+            try:
+                frame.planes[i].update(plane_data)
+            except Exception:
+                continue
+        _apply_common_frame_attrs(frame, payload)
+        _apply_audio_frame_attrs(frame, payload)
+        return WrappedAudioFrame(frame)
+
     storage = payload.get("storage", "inline")
     if storage == "shm":
         shm_name = payload.get("shm_name")
