@@ -73,7 +73,13 @@ def main() -> None:
     for i in range(15 * 240):  # 1分間実行
         frames = listener.pop_all_video_queue()
         if len(frames) != 0:
+            for frame in frames:
+                # グレースケールする
+                gray_frame = frame.frame.to_ndarray(format="gray")
+                frame.set_buffer(gray_frame)
             writer.enqueue_video_frames(frames)
+
+
         # 直送モードでは待機のみ
         time.sleep(1 / 240)
 
