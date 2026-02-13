@@ -47,7 +47,7 @@ def _is_picklable(value: Any) -> bool:
         return False
 
 
-_SHM_VIDEO_THRESHOLD_BYTES = 1 << 60
+_SHM_VIDEO_THRESHOLD_BYTES = 1 * 1024 * 1024
 _SHM_AUDIO_THRESHOLD_BYTES = 1 << 60
 
 

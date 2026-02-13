@@ -54,7 +54,6 @@ def main() -> None:
         width=1280,
         height=720,
         fps=30,
-        prefer_latest_video_payload=True,
         crop_ratio=0.8,
         stats_enabled=True,
         video_queue_maxlen=int(5*1.7),
