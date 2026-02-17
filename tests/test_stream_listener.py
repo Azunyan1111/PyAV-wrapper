@@ -58,6 +58,45 @@ def create_test_video_file(path: Path, duration_frames: int = 60) -> None:
     container.close()
 
 
+def create_test_opus_video_file(path: Path, duration_frames: int = 60) -> None:
+    """テスト用のOpus音声付き動画ファイルを作成"""
+    container = av.open(str(path), mode="w", format="matroska")
+
+    video_stream = container.add_stream("libx264", rate=30)
+    video_stream.width = 640
+    video_stream.height = 480
+    video_stream.pix_fmt = "yuv420p"
+
+    audio_stream = container.add_stream("libopus", rate=48000)
+    audio_stream.layout = "stereo"
+
+    for i in range(duration_frames):
+        video_frame = av.VideoFrame(640, 480, "yuv420p")
+        for plane in video_frame.planes:
+            data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+            plane.update(data)
+        video_frame.pts = i
+        for packet in video_stream.encode(video_frame):
+            container.mux(packet)
+
+        samples = 960
+        audio_data = np.zeros((2, samples), dtype=np.float32)
+        audio_frame = av.AudioFrame.from_ndarray(
+            audio_data, format="fltp", layout="stereo"
+        )
+        audio_frame.sample_rate = 48000
+        audio_frame.pts = i * samples
+        for packet in audio_stream.encode(audio_frame):
+            container.mux(packet)
+
+    for packet in video_stream.encode():
+        container.mux(packet)
+    for packet in audio_stream.encode():
+        container.mux(packet)
+
+    container.close()
+
+
 class TestStreamListenerInit:
     """StreamListener初期化のテスト"""
 
@@ -303,6 +342,55 @@ class TestStreamListenerAudioQueue:
         assert len(forwarded_payloads) == 1
         assert len(listener.audio_queue) == 1
         assert isinstance(listener.audio_queue[0], WrappedAudioFrame)
+
+    def test_set_audio_packet_payload_forwarder_rejects_forward_only_false(self):
+        """audio packet passthroughはforward_only=Trueのみ受け付ける"""
+        listener = StreamListener.__new__(StreamListener)
+        listener.is_running = False
+        listener._audio_packet_passthrough_enabled = False
+        listener._audio_packet_codec_name = "opus"
+        listener._audio_packet_payload_forwarder = None
+        listener._audio_packet_forward_only = False
+
+        with pytest.raises(ValueError):
+            listener.set_audio_packet_payload_forwarder(
+                lambda payload: payload,
+                codec_name="opus",
+                forward_only=False,
+            )
+
+    def test_forward_opus_packets_to_writer_forward_only(self):
+        """Opus packetモードでaudio payloadをそのままwriterへ転送できる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test_opus.mkv"
+            create_test_opus_video_file(test_file, duration_frames=180)
+
+            listener = StreamListener(str(test_file), width=640, height=480)
+            forwarded_payloads: list[dict[str, object]] = []
+
+            class _WriterStub:
+                def enqueue_audio_packet_payload(self, payload: dict[str, object]) -> None:
+                    forwarded_payloads.append(payload)
+
+            try:
+                listener.forward_opus_packets_to_writer(_WriterStub(), forward_only=True)
+                with listener.audio_queue_lock:
+                    listener.audio_queue.clear()
+                    listener._audio_queue_samples = 0
+
+                deadline = time.time() + 8.0
+                while time.time() < deadline and len(forwarded_payloads) == 0:
+                    time.sleep(0.05)
+
+                assert len(forwarded_payloads) > 0
+                payload = forwarded_payloads[0]
+                assert payload.get("payload_type") == "audio_packet"
+                assert payload.get("codec_name") == "opus"
+                assert isinstance(payload.get("packet_bytes"), (bytes, bytearray))
+                with listener.audio_queue_lock:
+                    assert len(listener.audio_queue) == 0
+            finally:
+                listener.stop()
 
 
 class TestStreamListenerControl:

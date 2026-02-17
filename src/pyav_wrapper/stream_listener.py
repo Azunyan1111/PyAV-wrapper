@@ -159,6 +159,7 @@ def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
 
     payload.update(
         {
+            "payload_type": "audio_frame",
             "format": frame.format.name,
             "layout": frame.layout.name,
             "sample_rate": frame.sample_rate,
@@ -173,6 +174,43 @@ def _serialize_audio_frame(frame: av.AudioFrame) -> dict[str, Any]:
         }
     )
     return payload
+
+
+def _serialize_audio_packet(packet: av.Packet, stream: Any) -> dict[str, Any]:
+    codec_name = ""
+    sample_rate: int | None = None
+    layout_name: str | None = None
+    try:
+        codec_ctx = stream.codec_context
+        codec_name = str(codec_ctx.name).lower()
+        sample_rate = codec_ctx.sample_rate
+        layout = codec_ctx.layout
+        if layout is not None:
+            layout_name = layout.name
+    except Exception:
+        pass
+
+    time_base = packet.time_base
+    if time_base is None:
+        try:
+            time_base = stream.time_base
+        except Exception:
+            time_base = None
+    serialized_time_base: tuple[int, int] | None = None
+    if time_base is not None:
+        serialized_time_base = (time_base.numerator, time_base.denominator)
+
+    return {
+        "payload_type": "audio_packet",
+        "codec_name": codec_name,
+        "sample_rate": sample_rate,
+        "layout": layout_name,
+        "packet_bytes": bytes(packet),
+        "pts": packet.pts,
+        "dts": packet.dts,
+        "duration": packet.duration,
+        "time_base": serialized_time_base,
+    }
 
 
 def _put_with_drop(
@@ -211,6 +249,8 @@ def _stream_listener_decode_worker(
     audio_queue: multiprocessing.Queue,
     video_drop_count: int,
     audio_drop_count: int,
+    audio_packet_passthrough_enabled: bool,
+    audio_packet_codec_name: str,
 ) -> None:
     container: av.Container | None = None
     try:
@@ -227,24 +267,43 @@ def _stream_listener_decode_worker(
             else None
         )
 
-        streams_to_decode = [
+        streams_to_read = [
             s for s in [video_stream, audio_stream] if s is not None
         ]
 
-        for frame in container.decode(*streams_to_decode):
+        for packet in container.demux(*streams_to_read):
             if stop_event.is_set():
                 break
 
-            if isinstance(frame, av.VideoFrame):
-                if width is not None and height is not None:
-                    if frame.width != width or frame.height != height:
-                        frame = frame.reformat(width=width, height=height)
-                payload = _serialize_video_frame(frame)
-                _put_with_drop(video_queue, payload, video_drop_count)
+            if packet.dts is None:
+                continue
 
-            elif isinstance(frame, av.AudioFrame):
-                payload = _serialize_audio_frame(frame)
-                _put_with_drop(audio_queue, payload, audio_drop_count)
+            if packet.stream.type == "video":
+                for frame in packet.decode():
+                    if width is not None and height is not None:
+                        if frame.width != width or frame.height != height:
+                            frame = frame.reformat(width=width, height=height)
+                    payload = _serialize_video_frame(frame)
+                    _put_with_drop(video_queue, payload, video_drop_count)
+
+            elif packet.stream.type == "audio":
+                if audio_packet_passthrough_enabled:
+                    codec_name = ""
+                    try:
+                        codec_name = str(packet.stream.codec_context.name).lower()
+                    except Exception:
+                        pass
+                    if codec_name != audio_packet_codec_name:
+                        raise RuntimeError(
+                            "Opusパケット転送モードではopus音声のみを扱えます: "
+                            f"detected={codec_name or 'unknown'}"
+                        )
+                    payload = _serialize_audio_packet(packet, packet.stream)
+                    _put_with_drop(audio_queue, payload, audio_drop_count)
+                else:
+                    for frame in packet.decode():
+                        payload = _serialize_audio_frame(frame)
+                        _put_with_drop(audio_queue, payload, audio_drop_count)
 
     except Exception as e:
         print(f"フレーム読み込みエラー: {str(e)}")
@@ -329,6 +388,10 @@ class StreamListener:
         self.audio_queue_lock = threading.Lock()
         self._audio_payload_forwarder: Callable[[dict[str, Any]], None] | None = None
         self._audio_forward_only = False
+        self._audio_packet_payload_forwarder: Callable[[dict[str, Any]], None] | None = None
+        self._audio_packet_forward_only = False
+        self._audio_packet_passthrough_enabled = False
+        self._audio_packet_codec_name = "opus"
 
         # multiprocessing
         self._mp_ctx = multiprocessing.get_context()
@@ -399,6 +462,8 @@ class StreamListener:
                 self._audio_mp_queue,
                 self._video_drop_count,
                 self._audio_drop_count,
+                self._audio_packet_passthrough_enabled,
+                self._audio_packet_codec_name,
             ),
             daemon=True,
         )
@@ -427,6 +492,42 @@ class StreamListener:
         """
         self._audio_payload_forwarder = forwarder
         self._audio_forward_only = bool(forwarder is not None and forward_only)
+        if forwarder is not None and getattr(self, "_audio_packet_passthrough_enabled", False):
+            self.set_audio_packet_payload_forwarder(
+                None,
+                codec_name=getattr(self, "_audio_packet_codec_name", "opus"),
+                forward_only=True,
+            )
+
+    def set_audio_packet_payload_forwarder(
+        self,
+        forwarder: Callable[[dict[str, Any]], None] | None,
+        codec_name: str = "opus",
+        forward_only: bool = True,
+    ) -> None:
+        """音声packet payloadを受信時に直接転送するforwarderを設定する
+
+        Args:
+            forwarder: packet payload(dict)を受け取るコールバック。Noneで無効化。
+            codec_name: passthrough対象コーデック名。現状はopusのみ対応。
+            forward_only: True以外はサポートしない。
+        """
+        normalized_codec_name = str(codec_name).lower()
+        if normalized_codec_name != "opus":
+            raise ValueError(f"codec_nameはopusのみ対応しています: {codec_name}")
+        if forwarder is not None and not forward_only:
+            raise ValueError("audio packet passthroughではforward_only=Trueのみ対応しています")
+
+        mode_changed = (
+            getattr(self, "_audio_packet_passthrough_enabled", False) != (forwarder is not None)
+            or getattr(self, "_audio_packet_codec_name", "opus") != normalized_codec_name
+        )
+        self._audio_packet_payload_forwarder = forwarder
+        self._audio_packet_forward_only = bool(forwarder is not None and forward_only)
+        self._audio_packet_passthrough_enabled = bool(forwarder is not None)
+        self._audio_packet_codec_name = normalized_codec_name
+        if mode_changed and getattr(self, "is_running", False):
+            self._request_restart()
 
     def forward_audio_to_writer(self, writer: Any, forward_only: bool = True) -> None:
         """writerのenqueue_audio_payloadへ音声payloadを直接転送する
@@ -439,6 +540,24 @@ class StreamListener:
         if not callable(enqueue_audio_payload):
             raise ValueError("writerはenqueue_audio_payload(payload)を実装している必要があります")
         self.set_audio_payload_forwarder(enqueue_audio_payload, forward_only=forward_only)
+
+    def forward_opus_packets_to_writer(self, writer: Any, forward_only: bool = True) -> None:
+        """writerのenqueue_audio_packet_payloadへOpus packet payloadを直接転送する
+
+        Args:
+            writer: enqueue_audio_packet_payload(payload)を実装するwriterインスタンス
+            forward_only: True以外はサポートしない。
+        """
+        enqueue_audio_packet_payload = getattr(writer, "enqueue_audio_packet_payload", None)
+        if not callable(enqueue_audio_packet_payload):
+            raise ValueError(
+                "writerはenqueue_audio_packet_payload(payload)を実装している必要があります"
+            )
+        self.set_audio_packet_payload_forwarder(
+            enqueue_audio_packet_payload,
+            codec_name="opus",
+            forward_only=forward_only,
+        )
 
     def set_video_payload_forwarder(
         self,
@@ -547,6 +666,8 @@ class StreamListener:
         return wrapped
 
     def _deserialize_audio_frame(self, payload: dict[str, Any]) -> WrappedAudioFrame:
+        if payload.get("payload_type") == "audio_packet":
+            raise ValueError("audio_packet payloadはAudioFrameにデシリアライズできません")
         planes = payload.get("planes")
         if isinstance(planes, list):
             frame = av.AudioFrame(
@@ -807,8 +928,12 @@ class StreamListener:
             processed_payloads += 1
 
             for payload in _iter_payloads(payload_obj):
+                payload_type = payload.get("payload_type", "audio_frame")
                 forwarded = False
-                forwarder = self._audio_payload_forwarder
+                if payload_type == "audio_packet":
+                    forwarder = self._audio_packet_payload_forwarder
+                else:
+                    forwarder = self._audio_payload_forwarder
                 if forwarder is not None:
                     try:
                         forwarder(payload)
@@ -816,9 +941,16 @@ class StreamListener:
                     except Exception as e:
                         print(f"Audio payload転送エラー: {repr(e)}")
 
-                if not (forwarded and self._audio_forward_only):
-                    wrapped = self._deserialize_audio_frame(payload)
-                    self.append_audio_queue(wrapped)
+                if payload_type == "audio_packet":
+                    if not (forwarded and self._audio_packet_forward_only):
+                        if forwarder is None:
+                            print("audio_packet payload受信: 転送先未設定のため破棄します")
+                        else:
+                            print("audio_packet payloadはforward_only=True以外をサポートしません")
+                else:
+                    if not (forwarded and self._audio_forward_only):
+                        wrapped = self._deserialize_audio_frame(payload)
+                        self.append_audio_queue(wrapped)
                 self._last_successful_read_time = time.time()
                 self._stats_audio_frame_count += 1
                 drained = True

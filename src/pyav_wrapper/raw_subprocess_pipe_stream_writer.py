@@ -16,6 +16,7 @@ from pyav_wrapper.stream_writer import (
     StreamWriter,
     _StreamWriterContainerProxy,
     _deserialize_audio_frame,
+    _deserialize_audio_packet,
     _deserialize_video_frame,
     _cleanup_payload_shared_memory,
     _drop_if_full,
@@ -57,9 +58,12 @@ def _raw_subprocess_pipe_stream_writer_worker(
     container: av.Container | None = None
     video_stream = None
     audio_stream = None
+    audio_mode: str | None = None
+    audio_packet_pts_shift: int | None = None
     process: subprocess.Popen | None = None
     stderr_file = None
     last_video_frame = None
+    fatal_error = False
 
     stats_video_frame_count: int = 0
     stats_audio_frame_count: int = 0
@@ -159,7 +163,35 @@ def _raw_subprocess_pipe_stream_writer_worker(
             return pending_audio_payloads.popleft()
         return None
 
-    def _open_container():
+    def _audio_payload_type(payload: dict[str, object] | None) -> str:
+        if payload is None:
+            return "audio_frame"
+        payload_type = payload.get("payload_type")
+        if payload_type == "audio_packet":
+            return "audio_packet"
+        return "audio_frame"
+
+    def _wait_for_initial_audio_payload(timeout: float) -> dict[str, object] | None:
+        deadline = time.monotonic() + timeout
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                payload_obj = audio_queue.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                continue
+            first_payload: dict[str, object] | None = None
+            for payload in _iter_audio_payloads(payload_obj):
+                if first_payload is None:
+                    first_payload = payload
+                else:
+                    pending_audio_payloads.append(payload)
+            if first_payload is not None:
+                return first_payload
+        return None
+
+    def _open_container(initial_audio_payload: dict[str, object] | None):
         if process is None or process.stdin is None:
             raise RuntimeError("サブプロセスのstdinが取得できません")
         next_container = av.open(process.stdin, format="matroska", mode="w")
@@ -169,10 +201,42 @@ def _raw_subprocess_pipe_stream_writer_worker(
         next_video_stream.height = height
         next_video_stream.pix_fmt = "yuv420p"
 
-        next_audio_stream = next_container.add_stream("pcm_s16le", rate=sample_rate)
-        next_audio_stream.layout = audio_layout
+        initial_audio_type = _audio_payload_type(initial_audio_payload)
+        if initial_audio_type == "audio_packet":
+            codec_name = str(initial_audio_payload.get("codec_name", "")).lower()
+            if codec_name != "opus":
+                raise RuntimeError(
+                    "audio_packet passthroughはopusのみ対応です: "
+                    f"codec_name={codec_name or 'unknown'}"
+                )
+            packet_sample_rate = initial_audio_payload.get("sample_rate")
+            if isinstance(packet_sample_rate, int) and packet_sample_rate > 0:
+                target_sample_rate = packet_sample_rate
+            else:
+                target_sample_rate = sample_rate
+            next_audio_stream = next_container.add_stream("libopus", rate=target_sample_rate)
+            packet_layout = initial_audio_payload.get("layout")
+            target_layout = (
+                packet_layout if isinstance(packet_layout, str) and packet_layout else audio_layout
+            )
+            next_audio_stream.layout = target_layout
+            return next_container, next_video_stream, next_audio_stream, "audio_packet"
 
-        return next_container, next_video_stream, next_audio_stream
+        if initial_audio_payload is not None:
+            payload_sample_rate = initial_audio_payload.get("sample_rate")
+            payload_layout = initial_audio_payload.get("layout")
+        else:
+            payload_sample_rate = None
+            payload_layout = None
+        if isinstance(payload_sample_rate, int) and payload_sample_rate > 0:
+            target_sample_rate = payload_sample_rate
+        else:
+            target_sample_rate = sample_rate
+        next_audio_stream = next_container.add_stream("pcm_s16le", rate=target_sample_rate)
+        target_layout = payload_layout if isinstance(payload_layout, str) and payload_layout else audio_layout
+        next_audio_stream.layout = target_layout
+
+        return next_container, next_video_stream, next_audio_stream, "audio_frame"
 
     def _handle_control_commands() -> bool:
         if control_queue is None:
@@ -186,6 +250,13 @@ def _raw_subprocess_pipe_stream_writer_worker(
             if isinstance(command_payload, dict) and command_payload.get("cmd") == "close_container":
                 close_requested = True
         return close_requested
+
+    def _notify_fatal_error(message: str) -> None:
+        nonlocal fatal_error
+        fatal_error = True
+        _notify_status("fatal_error", {"message": message})
+        print(f"致命的エラー: {message}", file=sys.stderr)
+        stop_event.set()
 
     try:
         first_payload = _wait_for_first_video_payload()
@@ -203,7 +274,10 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 stdin=subprocess.PIPE,
                 stderr=stderr_dest,
             )
-            container, video_stream, audio_stream = _open_container()
+            initial_audio_payload = _wait_for_initial_audio_payload(timeout=2.0)
+            if initial_audio_payload is not None:
+                pending_audio_payloads.appendleft(initial_audio_payload)
+            container, video_stream, audio_stream, audio_mode = _open_container(initial_audio_payload)
             for packet in video_stream.encode(first_frame.frame):
                 container.mux(packet)
             last_write_time = time.time()
@@ -265,24 +339,61 @@ def _raw_subprocess_pipe_stream_writer_worker(
                     print(f"RawSubprocessPipeStreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
             drained_audio_samples = 0
-            while drained_audio_samples < audio_samples_target_per_cycle:
+            while True:
                 audio_payload = _get_audio_payload_nowait()
                 if audio_payload is None:
                     break
-                wrapped_audio = _deserialize_audio_frame(audio_payload)
                 has_data = True
-                frame_samples = wrapped_audio.frame.samples
-                if frame_samples is None or frame_samples <= 0:
-                    frame_samples = 1
                 try:
-                    for packet in audio_stream.encode(wrapped_audio.frame):
+                    payload_type = _audio_payload_type(audio_payload)
+                    if payload_type != audio_mode:
+                        raise RuntimeError(
+                            "音声payloadの混在はサポートしていません: "
+                            f"current={audio_mode}, incoming={payload_type}"
+                        )
+                    if payload_type == "audio_packet":
+                        codec_name = str(audio_payload.get("codec_name", "")).lower()
+                        if codec_name != "opus":
+                            raise RuntimeError(
+                                "audio_packet passthroughはopusのみ対応です: "
+                                f"codec_name={codec_name or 'unknown'}"
+                            )
+                        packet = _deserialize_audio_packet(audio_payload)
+                        if audio_packet_pts_shift is None:
+                            base_ts = packet.dts
+                            if base_ts is None:
+                                base_ts = packet.pts
+                            if isinstance(base_ts, int) and base_ts < 0:
+                                audio_packet_pts_shift = -base_ts
+                            else:
+                                audio_packet_pts_shift = 0
+                        if audio_packet_pts_shift:
+                            if packet.pts is not None:
+                                packet.pts += audio_packet_pts_shift
+                            if packet.dts is not None:
+                                packet.dts += audio_packet_pts_shift
+                        packet.stream = audio_stream
                         container.mux(packet)
+                        frame_samples = 1
+                    else:
+                        wrapped_audio = _deserialize_audio_frame(audio_payload)
+                        frame_samples = wrapped_audio.frame.samples
+                        if frame_samples is None or frame_samples <= 0:
+                            frame_samples = 1
+                        for packet in audio_stream.encode(wrapped_audio.frame):
+                            container.mux(packet)
                     last_write_time = time.time()
                     stats_audio_frame_count += 1
                     pending_audio_count += 1
                 except Exception as e:
-                    print(f"RawSubprocessPipeStreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                    _notify_fatal_error(f"RawSubprocessPipeStreamWriter音声処理失敗: {e}")
+                    break
                 drained_audio_samples += frame_samples
+                if audio_mode == "audio_frame" and drained_audio_samples >= audio_samples_target_per_cycle:
+                    break
+
+            if fatal_error:
+                break
 
             if not has_data:
                 time.sleep(0.001)
@@ -300,6 +411,8 @@ def _raw_subprocess_pipe_stream_writer_worker(
                     stats_last_time = now
 
     except Exception as e:
+        if not fatal_error:
+            _notify_fatal_error(f"RawSubprocessPipeStreamWriter書き込みエラー: {e}")
         print(f"RawSubprocessPipeStreamWriter書き込みエラー: {e}", file=sys.stderr)
         traceback.print_exc()
     finally:
@@ -309,7 +422,7 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 if video_stream is not None:
                     for packet in video_stream.encode():
                         container.mux(packet)
-                if audio_stream is not None:
+                if audio_stream is not None and audio_mode == "audio_frame":
                     for packet in audio_stream.encode():
                         container.mux(packet)
                 container.close()

@@ -16,7 +16,10 @@ from pyav_wrapper import (
     WrappedVideoFrame,
 )
 from pyav_wrapper.stream_listener import _serialize_audio_frame as _serialize_listener_audio_frame
-from pyav_wrapper.stream_writer import _deserialize_audio_frame as _deserialize_writer_audio_frame
+from pyav_wrapper.stream_writer import (
+    _deserialize_audio_frame as _deserialize_writer_audio_frame,
+    _deserialize_audio_packet as _deserialize_writer_audio_packet,
+)
 
 
 def create_test_video_frame(width: int = 1280, height: int = 720) -> WrappedVideoFrame:
@@ -36,6 +39,79 @@ def create_test_audio_frame(
     frame = av.AudioFrame.from_ndarray(audio_data, format="fltp", layout="stereo")
     frame.sample_rate = sample_rate
     return WrappedAudioFrame(frame)
+
+
+def create_test_opus_video_file(path: Path, duration_frames: int = 60) -> None:
+    """テスト用のOpus音声付き動画ファイルを作成"""
+    container = av.open(str(path), mode="w", format="matroska")
+
+    video_stream = container.add_stream("libx264", rate=30)
+    video_stream.width = 640
+    video_stream.height = 480
+    video_stream.pix_fmt = "yuv420p"
+
+    audio_stream = container.add_stream("libopus", rate=48000)
+    audio_stream.layout = "stereo"
+
+    for i in range(duration_frames):
+        video_frame = av.VideoFrame(640, 480, "yuv420p")
+        for plane in video_frame.planes:
+            data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+            plane.update(data)
+        video_frame.pts = i
+        for packet in video_stream.encode(video_frame):
+            container.mux(packet)
+
+        samples = 960
+        audio_data = np.zeros((2, samples), dtype=np.float32)
+        audio_frame = av.AudioFrame.from_ndarray(
+            audio_data, format="fltp", layout="stereo"
+        )
+        audio_frame.sample_rate = 48000
+        audio_frame.pts = i * samples
+        for packet in audio_stream.encode(audio_frame):
+            container.mux(packet)
+
+    for packet in video_stream.encode():
+        container.mux(packet)
+    for packet in audio_stream.encode():
+        container.mux(packet)
+    container.close()
+
+
+def extract_opus_packet_payloads(path: Path, limit: int = 30) -> list[dict[str, object]]:
+    """Opus音声packetをwriter向けpayloadに変換して取得"""
+    container = av.open(str(path))
+    stream = container.streams.audio[0]
+    payloads: list[dict[str, object]] = []
+    try:
+        for packet in container.demux(stream):
+            if packet.dts is None:
+                continue
+            time_base = packet.time_base
+            if time_base is None:
+                time_base = stream.time_base
+            serialized_time_base: tuple[int, int] | None = None
+            if time_base is not None:
+                serialized_time_base = (time_base.numerator, time_base.denominator)
+            payloads.append(
+                {
+                    "payload_type": "audio_packet",
+                    "codec_name": str(stream.codec_context.name).lower(),
+                    "sample_rate": stream.codec_context.sample_rate,
+                    "layout": stream.codec_context.layout.name,
+                    "packet_bytes": bytes(packet),
+                    "pts": packet.pts,
+                    "dts": packet.dts,
+                    "duration": packet.duration,
+                    "time_base": serialized_time_base,
+                }
+            )
+            if len(payloads) >= limit:
+                break
+    finally:
+        container.close()
+    return payloads
 
 
 class TestStreamWriterInit:
@@ -148,6 +224,111 @@ class TestStreamWriterAudioQueue:
         assert wrapped.frame.samples == samples
         assert wrapped.frame.sample_rate == 48000
         assert wrapped.frame.pts == 12345
+
+    def test_deserialize_audio_packet_restores_packet_fields(self):
+        """audio_packet payloadからPacketを復元できる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "source_opus.mkv"
+            create_test_opus_video_file(source_file, duration_frames=30)
+            payloads = extract_opus_packet_payloads(source_file, limit=1)
+            assert len(payloads) == 1
+
+            payload = payloads[0]
+            packet = _deserialize_writer_audio_packet(payload)
+
+            assert bytes(packet) == payload["packet_bytes"]
+            assert packet.pts == payload["pts"]
+            assert packet.dts == payload["dts"]
+            assert packet.duration == payload["duration"]
+            assert packet.time_base is not None
+
+    def test_enqueue_audio_packet_payload_writes_opus_without_reencode(self):
+        """audio_packet payloadをそのままmuxし、出力codecがopusになる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "source_opus.mkv"
+            output_file = Path(tmpdir) / "output_opus.ts"
+            create_test_opus_video_file(source_file, duration_frames=90)
+            payloads = extract_opus_packet_payloads(source_file, limit=40)
+            assert len(payloads) > 0
+
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+
+            for i in range(20):
+                frame = create_test_video_frame(640, 480)
+                frame.frame.pts = i * 3000
+                frame.frame.time_base = Fraction(1, 90000)
+                writer.enqueue_video_frame(frame)
+            time.sleep(1.0)
+
+            for payload in payloads:
+                writer.enqueue_audio_packet_payload(payload)
+            time.sleep(1.5)
+            writer.stop()
+
+            assert output_file.exists()
+            assert output_file.stat().st_size > 0
+
+            probe_result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(output_file),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert probe_result.returncode == 0
+            assert "opus" in probe_result.stdout.strip().lower()
+
+    def test_audio_packet_non_opus_triggers_fatal_error(self):
+        """非Opusのaudio_packetは致命的エラーとして停止する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "fatal_non_opus.ts"
+            writer = StreamWriter(
+                url=str(output_file),
+                width=640,
+                height=480,
+                fps=30,
+            )
+
+            frame = create_test_video_frame(640, 480)
+            frame.frame.pts = 0
+            frame.frame.time_base = Fraction(1, 90000)
+            writer.enqueue_video_frame(frame)
+            time.sleep(1.0)
+
+            writer.enqueue_audio_packet_payload(
+                {
+                    "payload_type": "audio_packet",
+                    "codec_name": "aac",
+                    "sample_rate": 48000,
+                    "layout": "stereo",
+                    "packet_bytes": b"\x00\x01",
+                    "pts": 0,
+                    "dts": 0,
+                    "duration": 1,
+                    "time_base": (1, 1000),
+                }
+            )
+
+            deadline = time.time() + 6.0
+            while time.time() < deadline and writer.is_running:
+                time.sleep(0.1)
+
+            assert writer.is_running is False
+            writer.stop()
 
 
 class TestStreamWriterControl:

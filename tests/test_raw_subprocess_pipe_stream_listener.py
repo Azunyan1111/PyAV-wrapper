@@ -1,11 +1,16 @@
 import fcntl
+import multiprocessing
 import os
+import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
 
+import av
+import numpy as np
 import pytest
 from dotenv import load_dotenv
 
@@ -15,6 +20,7 @@ from pyav_wrapper import (
     WrappedAudioFrame,
     WrappedVideoFrame,
 )
+from pyav_wrapper.raw_subprocess_pipe_stream_listener import _raw_subprocess_pipe_decode_worker
 
 load_dotenv()
 
@@ -40,6 +46,42 @@ def check_whep_available() -> bool:
 
 
 WHEP_AVAILABLE = check_whep_available()
+
+
+def create_test_opus_video_file(path: Path, duration_frames: int = 60) -> None:
+    """テスト用のOpus音声付き動画ファイルを作成"""
+    container = av.open(str(path), mode="w", format="matroska")
+
+    video_stream = container.add_stream("libx264", rate=30)
+    video_stream.width = 640
+    video_stream.height = 480
+    video_stream.pix_fmt = "yuv420p"
+
+    audio_stream = container.add_stream("libopus", rate=48000)
+    audio_stream.layout = "stereo"
+
+    for i in range(duration_frames):
+        video_frame = av.VideoFrame(640, 480, "yuv420p")
+        for plane in video_frame.planes:
+            data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+            plane.update(data)
+        video_frame.pts = i
+        for packet in video_stream.encode(video_frame):
+            container.mux(packet)
+
+        samples = 960
+        audio_data = np.zeros((2, samples), dtype=np.float32)
+        audio_frame = av.AudioFrame.from_ndarray(audio_data, format="fltp", layout="stereo")
+        audio_frame.sample_rate = 48000
+        audio_frame.pts = i * samples
+        for packet in audio_stream.encode(audio_frame):
+            container.mux(packet)
+
+    for packet in video_stream.encode():
+        container.mux(packet)
+    for packet in audio_stream.encode():
+        container.mux(packet)
+    container.close()
 
 
 class _WhipWhepLock:
@@ -90,6 +132,56 @@ class TestRawSubprocessPipeStreamListenerReconnection:
             RawSubprocessPipeStreamListener._restart_connection
             is not StreamListener._restart_connection
         )
+
+
+class TestRawSubprocessPipeStreamListenerPacketPassthrough:
+    """RawSubprocessPipeStreamListenerのOpus packet passthroughテスト"""
+
+    def test_decode_worker_emits_audio_packet_payload(self):
+        """Opus packetモード有効時にaudio_packet payloadを出力する"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "source_opus.mkv"
+            create_test_opus_video_file(source_file, duration_frames=90)
+
+            mp_ctx = multiprocessing.get_context()
+            stop_event = mp_ctx.Event()
+            video_queue: queue.Queue[object] = queue.Queue()
+            audio_queue: queue.Queue[object] = queue.Queue()
+
+            _raw_subprocess_pipe_decode_worker(
+                command=["cat", str(source_file)],
+                width=640,
+                height=480,
+                stop_event=stop_event,
+                video_queue=video_queue,
+                audio_queue=audio_queue,
+                video_drop_count=1,
+                audio_drop_count=1,
+                start_timeout_seconds=5.0,
+                start_retry_interval_seconds=0.1,
+                stderr_log_path=None,
+                audio_packet_passthrough_enabled=True,
+                audio_packet_codec_name="opus",
+            )
+
+            audio_payloads: list[dict[str, object]] = []
+            while True:
+                try:
+                    item = audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(item, dict):
+                    audio_payloads.append(item)
+                elif isinstance(item, list):
+                    for payload in item:
+                        if isinstance(payload, dict):
+                            audio_payloads.append(payload)
+
+            assert len(audio_payloads) > 0
+            first_payload = audio_payloads[0]
+            assert first_payload.get("payload_type") == "audio_packet"
+            assert first_payload.get("codec_name") == "opus"
+            assert isinstance(first_payload.get("packet_bytes"), (bytes, bytearray))
 
 
 @pytest.mark.skipif(

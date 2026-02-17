@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import fractions
 import multiprocessing
 import os
@@ -161,6 +162,7 @@ def _serialize_audio_frame(frame: WrappedAudioFrame) -> dict[str, Any]:
     if shm_payload is None:
         payload.update(
             {
+                "payload_type": "audio_frame",
                 "format": frame.frame.format.name,
                 "layout": frame.frame.layout.name,
                 "sample_rate": frame.frame.sample_rate,
@@ -178,6 +180,7 @@ def _serialize_audio_frame(frame: WrappedAudioFrame) -> dict[str, Any]:
     storage = "shm"
     payload.update(
         {
+            "payload_type": "audio_frame",
             "format": frame.frame.format.name,
             "layout": frame.frame.layout.name,
             "sample_rate": frame.frame.sample_rate,
@@ -283,6 +286,8 @@ def _deserialize_video_frame(payload: dict[str, Any]) -> WrappedVideoFrame:
 
 
 def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
+    if payload.get("payload_type") == "audio_packet":
+        raise ValueError("audio_packet payloadはAudioFrameにデシリアライズできません")
     planes = payload.get("planes")
     if isinstance(planes, list):
         frame = av.AudioFrame(
@@ -349,6 +354,25 @@ def _deserialize_audio_frame(payload: dict[str, Any]) -> WrappedAudioFrame:
     _apply_common_frame_attrs(frame, payload)
     _apply_audio_frame_attrs(frame, payload)
     return WrappedAudioFrame(frame)
+
+
+def _deserialize_audio_packet(payload: dict[str, Any]) -> av.Packet:
+    packet_bytes = payload.get("packet_bytes")
+    if not isinstance(packet_bytes, (bytes, bytearray)):
+        raise ValueError("audio_packet payloadにpacket_bytes(bytes)が必要です")
+    packet = av.Packet(bytes(packet_bytes))
+    packet.pts = payload.get("pts")
+    packet.dts = payload.get("dts")
+    packet.duration = payload.get("duration")
+    time_base = payload.get("time_base")
+    if (
+        isinstance(time_base, (list, tuple))
+        and len(time_base) == 2
+        and time_base[0]
+        and time_base[1]
+    ):
+        packet.time_base = fractions.Fraction(int(time_base[0]), int(time_base[1]))
+    return packet
 
 
 def _put_with_drop(
@@ -438,7 +462,10 @@ def _stream_writer_worker(
     container: av.Container | None = None
     video_stream = None
     audio_stream = None
+    audio_mode: str | None = None
+    audio_packet_pts_shift: int | None = None
     last_video_frame: WrappedVideoFrame | None = None
+    fatal_error = False
 
     stats_video_frame_count: int = 0
     stats_audio_frame_count: int = 0
@@ -492,7 +519,11 @@ def _stream_writer_worker(
                 continue
         return None
 
-    def _open_container(target_width: int, target_height: int) -> tuple[av.Container, Any, Any]:
+    def _open_container(
+        target_width: int,
+        target_height: int,
+        initial_audio_payload: dict[str, Any] | None,
+    ) -> tuple[av.Container, Any, Any, str]:
         if url.startswith("srt://"):
             next_container = av.open(url, mode="w", format="mpegts")
         else:
@@ -504,10 +535,39 @@ def _stream_writer_worker(
         next_video_stream.pix_fmt = "yuv420p"
         next_video_stream.options = {"preset": "ultrafast", "tune": "zerolatency"}
 
-        next_audio_stream = next_container.add_stream("aac", rate=sample_rate)
-        next_audio_stream.layout = audio_layout
+        initial_audio_type = _audio_payload_type(initial_audio_payload)
+        if initial_audio_type == "audio_packet":
+            codec_name = str(initial_audio_payload.get("codec_name", "")).lower()
+            if codec_name != "opus":
+                raise RuntimeError(
+                    "audio_packet passthroughはopusのみ対応です: "
+                    f"codec_name={codec_name or 'unknown'}"
+                )
+            packet_sample_rate = initial_audio_payload.get("sample_rate")
+            if isinstance(packet_sample_rate, int) and packet_sample_rate > 0:
+                target_sample_rate = packet_sample_rate
+            else:
+                target_sample_rate = sample_rate
+            next_audio_stream = next_container.add_stream("libopus", rate=target_sample_rate)
+            packet_layout = initial_audio_payload.get("layout")
+            target_layout = packet_layout if isinstance(packet_layout, str) and packet_layout else audio_layout
+            next_audio_stream.layout = target_layout
+            return next_container, next_video_stream, next_audio_stream, "audio_packet"
 
-        return next_container, next_video_stream, next_audio_stream
+        if initial_audio_payload is not None:
+            payload_sample_rate = initial_audio_payload.get("sample_rate")
+            payload_layout = initial_audio_payload.get("layout")
+        else:
+            payload_sample_rate = None
+            payload_layout = None
+        if isinstance(payload_sample_rate, int) and payload_sample_rate > 0:
+            target_sample_rate = payload_sample_rate
+        else:
+            target_sample_rate = sample_rate
+        next_audio_stream = next_container.add_stream("aac", rate=target_sample_rate)
+        target_layout = payload_layout if isinstance(payload_layout, str) and payload_layout else audio_layout
+        next_audio_stream.layout = target_layout
+        return next_container, next_video_stream, next_audio_stream, "audio_frame"
 
     def _handle_control_commands() -> bool:
         if control_queue is None:
@@ -522,6 +582,65 @@ def _stream_writer_worker(
                 close_requested = True
         return close_requested
 
+    def _audio_payload_type(payload: dict[str, Any] | None) -> str:
+        if payload is None:
+            return "audio_frame"
+        payload_type = payload.get("payload_type")
+        if payload_type == "audio_packet":
+            return "audio_packet"
+        return "audio_frame"
+
+    def _iter_audio_payloads(payload_obj: Any):
+        if isinstance(payload_obj, dict):
+            yield payload_obj
+            return
+        if isinstance(payload_obj, list):
+            for payload in payload_obj:
+                if isinstance(payload, dict):
+                    yield payload
+
+    pending_audio_payloads: collections.deque[dict[str, Any]] = collections.deque()
+
+    def _wait_for_initial_audio_payload(timeout: float) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                payload_obj = audio_queue.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                continue
+            first_payload: dict[str, Any] | None = None
+            for payload in _iter_audio_payloads(payload_obj):
+                if first_payload is None:
+                    first_payload = payload
+                else:
+                    pending_audio_payloads.append(payload)
+            if first_payload is not None:
+                return first_payload
+        return None
+
+    def _get_next_audio_payload_nowait() -> dict[str, Any] | None:
+        if pending_audio_payloads:
+            return pending_audio_payloads.popleft()
+        try:
+            payload_obj = audio_queue.get_nowait()
+        except queue.Empty:
+            return None
+        for payload in _iter_audio_payloads(payload_obj):
+            pending_audio_payloads.append(payload)
+        if pending_audio_payloads:
+            return pending_audio_payloads.popleft()
+        return None
+
+    def _notify_fatal_error(message: str) -> None:
+        nonlocal fatal_error
+        fatal_error = True
+        _notify_status("fatal_error", {"message": message})
+        print(f"致命的エラー: {message}", file=sys.stderr)
+        stop_event.set()
+
     try:
         first_payload = _wait_for_first_video_payload()
         if first_payload is None:
@@ -533,7 +652,14 @@ def _stream_writer_worker(
             first_frame = first_frame.crop_center(crop_ratio)
 
         try:
-            container, video_stream, audio_stream = _open_container(width, height)
+            initial_audio_payload = _wait_for_initial_audio_payload(timeout=2.0)
+            if initial_audio_payload is not None:
+                pending_audio_payloads.appendleft(initial_audio_payload)
+            container, video_stream, audio_stream, audio_mode = _open_container(
+                width,
+                height,
+                initial_audio_payload,
+            )
             for packet in video_stream.encode(first_frame.frame):
                 container.mux(packet)
             last_write_time = time.time()
@@ -588,21 +714,55 @@ def _stream_writer_worker(
                     print(f"StreamWriter映像muxエラー（スキップ）: {e}", file=sys.stderr)
 
             while True:
-                try:
-                    audio_payload = audio_queue.get_nowait()
-                except queue.Empty:
+                audio_payload = _get_next_audio_payload_nowait()
+                if audio_payload is None:
                     break
-
-                wrapped_audio = _deserialize_audio_frame(audio_payload)
                 has_data = True
                 try:
-                    for packet in audio_stream.encode(wrapped_audio.frame):
+                    payload_type = _audio_payload_type(audio_payload)
+                    if payload_type != audio_mode:
+                        raise RuntimeError(
+                            "音声payloadの混在はサポートしていません: "
+                            f"current={audio_mode}, incoming={payload_type}"
+                        )
+                    if audio_stream is None:
+                        raise RuntimeError("音声ストリームの初期化に失敗しました")
+                    if payload_type == "audio_packet":
+                        codec_name = str(audio_payload.get("codec_name", "")).lower()
+                        if codec_name != "opus":
+                            raise RuntimeError(
+                                "audio_packet passthroughはopusのみ対応です: "
+                                f"codec_name={codec_name or 'unknown'}"
+                            )
+                        packet = _deserialize_audio_packet(audio_payload)
+                        if audio_packet_pts_shift is None:
+                            base_ts = packet.dts
+                            if base_ts is None:
+                                base_ts = packet.pts
+                            if isinstance(base_ts, int) and base_ts < 0:
+                                audio_packet_pts_shift = -base_ts
+                            else:
+                                audio_packet_pts_shift = 0
+                        if audio_packet_pts_shift:
+                            if packet.pts is not None:
+                                packet.pts += audio_packet_pts_shift
+                            if packet.dts is not None:
+                                packet.dts += audio_packet_pts_shift
+                        packet.stream = audio_stream
                         container.mux(packet)
+                    else:
+                        wrapped_audio = _deserialize_audio_frame(audio_payload)
+                        for packet in audio_stream.encode(wrapped_audio.frame):
+                            container.mux(packet)
                     last_write_time = time.time()
                     stats_audio_frame_count += 1
                     pending_audio_count += 1
                 except Exception as e:
-                    print(f"StreamWriter音声muxエラー（スキップ）: {e}", file=sys.stderr)
+                    _notify_fatal_error(f"StreamWriter音声処理失敗: {e}")
+                    break
+
+            if fatal_error:
+                break
 
             if not has_data:
                 time.sleep(0.001)
@@ -620,6 +780,8 @@ def _stream_writer_worker(
                     stats_last_time = now
 
     except Exception as e:
+        if not fatal_error:
+            _notify_fatal_error(f"StreamWriter書き込みエラー: {e}")
         print(f"StreamWriter書き込みエラー: {e}", file=sys.stderr)
         traceback.print_exc()
     finally:
@@ -629,7 +791,7 @@ def _stream_writer_worker(
                 if video_stream is not None:
                     for packet in video_stream.encode():
                         container.mux(packet)
-                if audio_stream is not None:
+                if audio_stream is not None and audio_mode == "audio_frame":
                     for packet in audio_stream.encode():
                         container.mux(packet)
                 container.close()
@@ -720,6 +882,7 @@ class StreamWriter:
         self._restart_frame_wait_timeout: float = 30.0
         self._restart_lock: threading.Lock = threading.Lock()
         self._restart_in_progress = False
+        self._fatal_error = False
 
         # FPS統計
         self._stats_enabled = stats_enabled
@@ -817,6 +980,13 @@ class StreamWriter:
                 message = payload.get("message")
                 if message:
                     print(f"処理開始エラー: {message}")
+            elif status == "fatal_error":
+                message = payload.get("message")
+                if message:
+                    print(f"致命的エラー: {message}")
+                self._fatal_error = True
+                self.is_running = False
+                self._request_container_close()
 
     def _request_container_close(self) -> None:
         if self._control_queue is None:
@@ -955,6 +1125,17 @@ class StreamWriter:
             _cleanup_payload_shared_memory(payload)
             print(f"音声ペイロードをMPキューに追加中にエラー: {repr(e)}")
 
+    def enqueue_audio_packet_payload(self, payload: dict[str, Any]) -> None:
+        """Opus音声packet payloadを直接MPキューへ追加"""
+        payload_type = payload.get("payload_type")
+        if payload_type not in (None, "audio_packet"):
+            raise ValueError(
+                "enqueue_audio_packet_payloadにはpayload_type='audio_packet'が必要です"
+            )
+        normalized_payload = dict(payload)
+        normalized_payload["payload_type"] = "audio_packet"
+        self.enqueue_audio_payload(normalized_payload)
+
     def start(self) -> None:
         """start_processing() をスレッドで起動するラッパー"""
         self._init_thread = threading.Thread(target=self.start_processing, daemon=True)
@@ -965,6 +1146,7 @@ class StreamWriter:
         try:
             if self.is_running:
                 return "ストリーム処理は既に開始しています"
+            self._fatal_error = False
             self._setup_multiprocessing()
             self.is_running = True
             self._start_write_process()
@@ -1198,7 +1380,7 @@ class StreamWriter:
         while self.is_running:
             self._drain_status_queue()
 
-            if not self.is_running:
+            if not self.is_running or self._fatal_error:
                 break
 
             write_process = getattr(self, "_write_process", None)
@@ -1208,6 +1390,8 @@ class StreamWriter:
                     time.sleep(0.1)
                     continue
                 if write_process and not write_process.is_alive():
+                    if self._fatal_error:
+                        break
                     self._force_restart()
 
             if self._last_successful_write_time > 0.0:
@@ -1217,6 +1401,8 @@ class StreamWriter:
                         f"書き込み更新が{elapsed:.1f}秒間停止。再接続を試みます "
                         f"(閾値: {self._restart_threshold:.1f}秒)"
                     )
+                    if self._fatal_error:
+                        break
                     self._force_restart()
 
             # FPS統計出力
@@ -1254,7 +1440,7 @@ class StreamWriter:
 
     def _force_restart(self) -> None:
         with self._restart_lock:
-            if not self.is_running or self._restart_in_progress:
+            if not self.is_running or self._restart_in_progress or self._fatal_error:
                 return
             self._restart_in_progress = True
             self._restart_threshold += self._restart_threshold_increment

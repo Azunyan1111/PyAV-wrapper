@@ -6,6 +6,7 @@ import av
 from pyav_wrapper.stream_listener import (
     StreamListener,
     _put_with_drop,
+    _serialize_audio_packet,
     _serialize_audio_frame,
     _serialize_video_frame,
 )
@@ -27,6 +28,8 @@ def _raw_subprocess_pipe_decode_worker(
     start_timeout_seconds: float,
     start_retry_interval_seconds: float,
     stderr_log_path: str | None,
+    audio_packet_passthrough_enabled: bool,
+    audio_packet_codec_name: str,
 ) -> None:
     process: subprocess.Popen | None = None
     container: av.container.Container | None = None
@@ -96,37 +99,61 @@ def _raw_subprocess_pipe_decode_worker(
             else None
         )
 
-        streams_to_decode = [
+        streams_to_read = [
             s for s in [video_stream, audio_stream] if s is not None
         ]
         should_reformat = width is not None and height is not None
 
-        for frame in container.decode(*streams_to_decode):
+        for packet in container.demux(*streams_to_read):
             if stop_event.is_set():
                 break
+            if packet.dts is None:
+                continue
 
-            if isinstance(frame, av.VideoFrame):
-                if should_reformat:
-                    if frame.width != width or frame.height != height:
-                        frame = frame.reformat(width=width, height=height)
-                payload = _serialize_video_frame(frame)
-                pending_video_payloads.append(payload)
-                _flush_payload_batch(
-                    video_queue,
-                    pending_video_payloads,
-                    video_drop_count,
-                    _VIDEO_PAYLOAD_BATCH_SIZE,
-                )
+            if packet.stream.type == "video":
+                for frame in packet.decode():
+                    if should_reformat:
+                        if frame.width != width or frame.height != height:
+                            frame = frame.reformat(width=width, height=height)
+                    payload = _serialize_video_frame(frame)
+                    pending_video_payloads.append(payload)
+                    _flush_payload_batch(
+                        video_queue,
+                        pending_video_payloads,
+                        video_drop_count,
+                        _VIDEO_PAYLOAD_BATCH_SIZE,
+                    )
 
-            elif isinstance(frame, av.AudioFrame):
-                payload = _serialize_audio_frame(frame)
-                pending_audio_payloads.append(payload)
-                _flush_payload_batch(
-                    audio_queue,
-                    pending_audio_payloads,
-                    audio_drop_count,
-                    _AUDIO_PAYLOAD_BATCH_SIZE,
-                )
+            elif packet.stream.type == "audio":
+                if audio_packet_passthrough_enabled:
+                    codec_name = ""
+                    try:
+                        codec_name = str(packet.stream.codec_context.name).lower()
+                    except Exception:
+                        pass
+                    if codec_name != audio_packet_codec_name:
+                        raise RuntimeError(
+                            "Opusパケット転送モードではopus音声のみを扱えます: "
+                            f"detected={codec_name or 'unknown'}"
+                        )
+                    payload = _serialize_audio_packet(packet, packet.stream)
+                    pending_audio_payloads.append(payload)
+                    _flush_payload_batch(
+                        audio_queue,
+                        pending_audio_payloads,
+                        audio_drop_count,
+                        _AUDIO_PAYLOAD_BATCH_SIZE,
+                    )
+                else:
+                    for frame in packet.decode():
+                        payload = _serialize_audio_frame(frame)
+                        pending_audio_payloads.append(payload)
+                        _flush_payload_batch(
+                            audio_queue,
+                            pending_audio_payloads,
+                            audio_drop_count,
+                            _AUDIO_PAYLOAD_BATCH_SIZE,
+                        )
 
     except Exception as e:
         print(f"フレーム読み込みエラー: {str(e)}")
@@ -236,6 +263,8 @@ class RawSubprocessPipeStreamListener(StreamListener):
                 self._start_timeout_seconds,
                 self._start_retry_interval_seconds,
                 self._stderr_log_path,
+                self._audio_packet_passthrough_enabled,
+                self._audio_packet_codec_name,
             ),
             daemon=True,
         )

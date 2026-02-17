@@ -1,10 +1,15 @@
 import fcntl
+import multiprocessing
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
+import av
+import numpy as np
 import pytest
 from dotenv import load_dotenv
 
@@ -15,6 +20,8 @@ from pyav_wrapper import (
     WrappedAudioFrame,
     WrappedVideoFrame,
 )
+from pyav_wrapper.raw_subprocess_pipe_stream_writer import _raw_subprocess_pipe_stream_writer_worker
+from pyav_wrapper.stream_listener import _serialize_video_frame
 
 load_dotenv()
 
@@ -46,6 +53,77 @@ def check_whip_whep_available() -> bool:
 WHIP_WHEP_AVAILABLE = check_whip_whep_available()
 
 
+def create_test_opus_video_file(path: Path, duration_frames: int = 60) -> None:
+    """テスト用のOpus音声付き動画ファイルを作成"""
+    container = av.open(str(path), mode="w", format="matroska")
+
+    video_stream = container.add_stream("libx264", rate=30)
+    video_stream.width = 640
+    video_stream.height = 480
+    video_stream.pix_fmt = "yuv420p"
+
+    audio_stream = container.add_stream("libopus", rate=48000)
+    audio_stream.layout = "stereo"
+
+    for i in range(duration_frames):
+        video_frame = av.VideoFrame(640, 480, "yuv420p")
+        for plane in video_frame.planes:
+            data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+            plane.update(data)
+        video_frame.pts = i
+        for packet in video_stream.encode(video_frame):
+            container.mux(packet)
+
+        samples = 960
+        audio_data = np.zeros((2, samples), dtype=np.float32)
+        audio_frame = av.AudioFrame.from_ndarray(audio_data, format="fltp", layout="stereo")
+        audio_frame.sample_rate = 48000
+        audio_frame.pts = i * samples
+        for packet in audio_stream.encode(audio_frame):
+            container.mux(packet)
+
+    for packet in video_stream.encode():
+        container.mux(packet)
+    for packet in audio_stream.encode():
+        container.mux(packet)
+    container.close()
+
+
+def extract_opus_packet_payloads(path: Path, limit: int = 30) -> list[dict[str, object]]:
+    """Opus音声packetをwriter向けpayloadに変換して取得"""
+    container = av.open(str(path))
+    stream = container.streams.audio[0]
+    payloads: list[dict[str, object]] = []
+    try:
+        for packet in container.demux(stream):
+            if packet.dts is None:
+                continue
+            time_base = packet.time_base
+            if time_base is None:
+                time_base = stream.time_base
+            serialized_time_base: tuple[int, int] | None = None
+            if time_base is not None:
+                serialized_time_base = (time_base.numerator, time_base.denominator)
+            payloads.append(
+                {
+                    "payload_type": "audio_packet",
+                    "codec_name": str(stream.codec_context.name).lower(),
+                    "sample_rate": stream.codec_context.sample_rate,
+                    "layout": stream.codec_context.layout.name,
+                    "packet_bytes": bytes(packet),
+                    "pts": packet.pts,
+                    "dts": packet.dts,
+                    "duration": packet.duration,
+                    "time_base": serialized_time_base,
+                }
+            )
+            if len(payloads) >= limit:
+                break
+    finally:
+        container.close()
+    return payloads
+
+
 class _WhipWhepLock:
     def __enter__(self):
         self._lock_file = open(LOCK_FILE_PATH, "w")
@@ -72,6 +150,112 @@ class TestRawSubprocessPipeStreamWriterInit:
     def test_inherits_stream_writer(self):
         """StreamWriterを継承しているか"""
         assert issubclass(RawSubprocessPipeStreamWriter, StreamWriter)
+
+
+class TestRawSubprocessPipeStreamWriterPacketPassthrough:
+    """RawSubprocessPipeStreamWriterのOpus packet passthroughテスト"""
+
+    def test_writer_worker_muxes_audio_packet_as_opus(self):
+        """audio_packet payloadを無加工でmuxし、出力codecがopusになる"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_file = Path(tmpdir) / "source_opus.mkv"
+            output_file = Path(tmpdir) / "writer_output.mkv"
+            create_test_opus_video_file(source_file, duration_frames=90)
+            audio_payloads = extract_opus_packet_payloads(source_file, limit=40)
+            assert len(audio_payloads) > 0
+
+            video_frame = av.VideoFrame(640, 480, "yuv420p")
+            for plane in video_frame.planes:
+                data = np.full(plane.buffer_size, 128, dtype=np.uint8)
+                plane.update(data)
+            video_frame.pts = 0
+            video_payload = _serialize_video_frame(video_frame)
+
+            mp_ctx = multiprocessing.get_context()
+            stop_event = mp_ctx.Event()
+            video_queue = mp_ctx.Queue(maxsize=100)
+            audio_queue = mp_ctx.Queue(maxsize=200)
+            status_queue = mp_ctx.Queue(maxsize=100)
+            control_queue = mp_ctx.Queue(maxsize=10)
+
+            video_queue.put(video_payload)
+            for payload in audio_payloads:
+                audio_queue.put(payload)
+
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib, sys;"
+                    "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+                ),
+                str(output_file),
+            ]
+
+            worker = mp_ctx.Process(
+                target=_raw_subprocess_pipe_stream_writer_worker,
+                args=(
+                    command,
+                    640,
+                    480,
+                    30,
+                    48000,
+                    "stereo",
+                    False,
+                    stop_event,
+                    video_queue,
+                    audio_queue,
+                    status_queue,
+                    control_queue,
+                    None,
+                    None,
+                ),
+                daemon=True,
+            )
+            worker.start()
+
+            started = False
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                try:
+                    status = status_queue.get(timeout=0.2)
+                except Exception:
+                    continue
+                if status.get("status") == "started":
+                    started = True
+                    break
+                if status.get("status") == "fatal_error":
+                    break
+
+            time.sleep(1.0)
+            stop_event.set()
+            worker.join(timeout=8.0)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=2.0)
+
+            assert started is True
+            assert output_file.exists()
+            assert output_file.stat().st_size > 0
+
+            probe_result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(output_file),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert probe_result.returncode == 0
+            assert "opus" in probe_result.stdout.strip().lower()
 
 
 @pytest.mark.skipif(

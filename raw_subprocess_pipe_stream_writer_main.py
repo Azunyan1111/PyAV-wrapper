@@ -40,7 +40,7 @@ def main() -> None:
     # 1. WHEP受信開始
     print(f"Starting WHEP listener for {WHEP_URL}...")
     listener = RawSubprocessPipeStreamListener(
-        command=[WHEP_CLIENT, WHEP_URL],
+        command=[WHEP_CLIENT, WHEP_URL, "--audio-opus-passthrough"],
         width=1600,
         height=900,
         batch_size=5,
@@ -65,8 +65,9 @@ def main() -> None:
     # print("Video direct forwarding enabled.")
 
     # 音声は受信payloadをそのままwriterへ直送する（デシリアライズ不要）
-    listener.forward_audio_to_writer(writer, forward_only=True)
-    print("Audio direct forwarding enabled.")
+    # listener.forward_audio_to_writer(writer, forward_only=True)
+    # print("Audio direct forwarding enabled.")
+    listener.forward_opus_packets_to_writer(writer, forward_only=True)
 
     # 4. 継続的に中継（300秒間）
     for i in range(15 * 240):  # 1分間実行
