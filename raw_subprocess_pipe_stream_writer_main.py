@@ -70,9 +70,12 @@ def main() -> None:
     listener.forward_opus_packets_to_writer(writer, forward_only=True)
 
     # 4. 継続的に中継（300秒間）
-    for i in range(15 * 240):  # 1分間実行
+    pop_time = time.time()
+    for i in range(60 * 240):  # 1分間実行
         frames = listener.pop_all_video_queue()
         if len(frames) != 0:
+            print(f"pop time: {time.time() - pop_time:.4f} sec, frames: {len(frames)}")
+            pop_time = time.time()
             for frame in frames:
                 # グレースケールする
                 gray_frame = frame.frame.to_ndarray(format="gray")
