@@ -982,7 +982,7 @@ class StreamListener:
             for _ in range(self.batch_size):
                 video_frame = self.video_queue.popleft()
                 if video_frame.frame.pts is not None and video_frame.frame.pts % 30 == 0:
-                    print(f"pipeline diff pop■:{(time.time() - video_frame.create_time) * 1000:.3f} ms. pts:{video_frame.frame.pts}")
+                    pass#print(f"pipeline diff pop■:{(time.time() - video_frame.create_time) * 1000:.3f} ms. pts:{video_frame.frame.pts}")
                 return_frames.append(video_frame)
             return return_frames
 

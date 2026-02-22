@@ -768,16 +768,7 @@ def _stream_writer_worker(
                 time.sleep(0.001)
             _flush_status_if_needed()
 
-            if stats_enabled:
-                now = time.monotonic()
-                stats_elapsed = now - stats_last_time
-                if stats_elapsed >= 5.0:
-                    video_fps = stats_video_frame_count / stats_elapsed
-                    audio_fps = stats_audio_frame_count / stats_elapsed
-                    print(f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}")
-                    stats_video_frame_count = 0
-                    stats_audio_frame_count = 0
-                    stats_last_time = now
+            # FPSログは監視スレッド側で一元出力する
 
     except Exception as e:
         if not fatal_error:

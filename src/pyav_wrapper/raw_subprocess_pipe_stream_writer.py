@@ -327,11 +327,11 @@ def _raw_subprocess_pipe_stream_writer_worker(
                     video_age_ms = (time.time() - create_time) * 1000.0
                     pts = wrapped_frame.frame.pts
                     if target:
-                        print(f"pipeline diff no encode★:{video_age_ms:.3f} ms pts:{pts}")
+                        pass#print(f"pipeline diff no encode★:{video_age_ms:.3f} ms pts:{pts}")
                     for packet in video_stream.encode(wrapped_frame.frame):
                         container.mux(packet)
                     if target:
-                        print(f"pipeline diff is encode●:{(time.time() - create_time) * 1000:.3f} ms pts:{pts}")
+                        pass#print(f"pipeline diff is encode●:{(time.time() - create_time) * 1000:.3f} ms pts:{pts}")
                     last_write_time = time.time()
                     stats_video_frame_count += 1
                     pending_video_count += 1
@@ -399,16 +399,7 @@ def _raw_subprocess_pipe_stream_writer_worker(
                 time.sleep(0.001)
             _flush_status_if_needed()
 
-            if stats_enabled:
-                now = time.monotonic()
-                stats_elapsed = now - stats_last_time
-                if stats_elapsed >= 5.0:
-                    video_fps = stats_video_frame_count / stats_elapsed
-                    audio_fps = stats_audio_frame_count / stats_elapsed
-                    print(f"[Writer] video_fps={video_fps:.2f} audio_fps={audio_fps:.2f}")
-                    stats_video_frame_count = 0
-                    stats_audio_frame_count = 0
-                    stats_last_time = now
+            # FPSログは監視スレッド側で一元出力する
 
     except Exception as e:
         if not fatal_error:
@@ -585,7 +576,7 @@ class RawSubprocessPipeStreamWriter(StreamWriter):
             pass
 
         if frame.frame.pts is not None and frame.frame.pts % 30 == 0:
-            print(f"pipeline diff send queue▲:{(time.time() - frame.create_time) * 1000:.3f} ms. pts:{frame.frame.pts}")
+            pass#print(f"pipeline diff send queue▲:{(time.time() - frame.create_time) * 1000:.3f} ms. pts:{frame.frame.pts}")
 
         try:
             payload: dict[str, object]
